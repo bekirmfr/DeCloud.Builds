@@ -1,4 +1,4 @@
-﻿# ── Go build outputs ────────────────────────────────────────────────
+# ── Go build outputs ────────────────────────────────────────────────
 # Compiled binaries (raw and encoded)
 system-vms/dht/dht-node-src/dht-node-amd64
 system-vms/dht/dht-node-src/dht-node-arm64

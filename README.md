@@ -1,4 +1,4 @@
-﻿# DeCloud.Builds
+# DeCloud.Builds
 
 Build pipeline and source for DeCloud system VM components.
 
