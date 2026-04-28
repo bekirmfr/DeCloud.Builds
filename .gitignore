@@ -1,0 +1,57 @@
+﻿# ── Go build outputs ────────────────────────────────────────────────
+# Compiled binaries (raw and encoded)
+system-vms/dht/dht-node-src/dht-node-amd64
+system-vms/dht/dht-node-src/dht-node-arm64
+system-vms/blockstore/blockstore-node-src/blockstore-node-amd64
+system-vms/blockstore/blockstore-node-src/blockstore-node-arm64
+
+# Encoded build artifacts (old gz+b64 format — not used in new pipeline)
+**/*.gz.b64
+**/*.b64
+
+# Source hash cache files (build.sh idempotency markers)
+**/.dht-node-source.sha256
+**/.blockstore-node-source.sha256
+
+# Go toolchain caches (auto-downloaded by build.sh self-bootstrapping)
+**/dht-node-src/.go-*
+**/dht-node-src/.gopath/
+**/dht-node-src/.gocache/
+**/blockstore-node-src/.go-*
+**/blockstore-node-src/.gopath/
+**/blockstore-node-src/.gocache/
+
+# Go module download cache
+**/vendor/
+
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── OS ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Secrets (should never be committed) ─────────────────────────────
+*.pem
+*.key
+*.env
+.env.*
+!.env.example

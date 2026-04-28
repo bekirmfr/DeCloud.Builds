@@ -1,0 +1,341 @@
+#cloud-config
+# DeCloud DHT VM Cloud-Init Configuration
+# Runs a libp2p Kademlia DHT node for peer discovery,
+# key-value storage, and GossipSub event propagation.
+# Version: 6.0 (optimized — nginx-light, root user, single daemon-reload)
+
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+
+package_update: false
+package_upgrade: false
+
+# Regenerate machine-id to prevent conflicts
+bootcmd:
+  - rm -f /etc/machine-id /var/lib/dbus/machine-id
+  - systemd-machine-id-setup
+  # Mask snapd/LXD — unused in system VMs, adds ~50s boot delay
+  - systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service lxd.service lxd-agent.service 2>/dev/null || true
+  # Start qemu-guest-agent early, independent of runcmd
+  - systemctl start qemu-guest-agent 2>/dev/null || true
+
+disable_root: false
+
+# SSH key authentication
+__SSH_AUTHORIZED_KEYS_BLOCK__
+
+ssh_pwauth: false
+
+# =====================================================
+# SYSTEM PACKAGES
+# =====================================================
+packages:
+  - qemu-guest-agent
+  - curl
+  - jq
+  - openssl
+  - nginx-light
+  - wireguard
+  - wireguard-tools
+  - python3
+
+# =====================================================
+# SYSTEM CONFIGURATION
+# =====================================================
+write_files:
+  # DHT binary (gzip+base64-encoded Go binary, decoded by cloud-init at boot)
+  - path: /usr/local/bin/dht-node
+    permissions: '0755'
+    encoding: gz+b64
+    content: __DHT_NODE_BINARY_GZ_BASE64__
+
+  # DHT environment file (read by systemd EnvironmentFile)
+  - path: /etc/decloud-dht/dht.env
+    permissions: '0644'
+    content: |
+      DHT_LISTEN_PORT=__DHT_LISTEN_PORT__
+      DHT_API_PORT=__DHT_API_PORT__
+      DHT_ADVERTISE_IP=__DHT_ADVERTISE_IP__
+      DHT_BOOTSTRAP_PEERS=__DHT_BOOTSTRAP_PEERS__
+      DHT_DATA_DIR=/var/lib/decloud-dht
+      DECLOUD_NODE_ID=__NODE_ID__
+      DECLOUD_REGION=__DHT_REGION__
+
+  # WireGuard mesh environment (consumed by enrollment script)
+  - path: /etc/decloud/wg-mesh.env
+    permissions: '0600'
+    content: |
+      WG_RELAY_ENDPOINT=__WG_RELAY_ENDPOINT__
+      WG_RELAY_PUBKEY=__WG_RELAY_PUBKEY__
+      WG_TUNNEL_IP=__WG_TUNNEL_IP__
+      WG_RELAY_API=__WG_RELAY_API__
+      WG_INTERFACE=wg-mesh
+      WG_DESCRIPTION=DHT-__VM_ID__
+      WG_PEER_TYPE=system-vm
+      WG_PARENT_NODE_ID=__NODE_ID__
+      WG_ROLE=dht
+
+  # WireGuard mesh enrollment script
+  - path: /usr/local/bin/wg-mesh-enroll.sh
+    permissions: '0755'
+    content: |
+      __WG_MESH_ENROLL__
+
+  - path: /usr/local/bin/wg-config-fetch.sh
+    permissions: '0755'
+    content: |
+      __WG_CONFIG_FETCH__
+
+  # WireGuard mesh watchdog — re-enrolls if handshake goes stale
+  - path: /usr/local/bin/wg-mesh-watchdog.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # Re-enroll if WireGuard handshake has been stale for > 3 minutes.
+      # Called by systemd timer every 2 minutes.
+      WG_INTERFACE="wg-mesh"
+      STALE_THRESHOLD=180
+
+      if ! wg show "$WG_INTERFACE" &>/dev/null; then
+          echo "[wg-watchdog] Interface not up — re-enrolling"
+          /usr/local/bin/wg-mesh-enroll.sh
+          exit 0
+      fi
+
+      LAST_HANDSHAKE=$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+      NOW=$(date +%s)
+      AGE=$(( NOW - ${LAST_HANDSHAKE:-0} ))
+
+      if [ "${LAST_HANDSHAKE:-0}" -eq 0 ] || [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
+          echo "[wg-watchdog] Handshake stale (${AGE}s) — re-enrolling"
+          /usr/local/bin/wg-mesh-enroll.sh
+      else
+          echo "[wg-watchdog] Handshake OK (${AGE}s ago)"
+      fi
+
+  - path: /etc/systemd/system/wg-mesh-watchdog.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=WireGuard Mesh Connectivity Watchdog
+      After=wg-quick@wg-mesh.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/wg-mesh-watchdog.sh
+      StandardOutput=journal
+      StandardError=journal
+
+  - path: /etc/systemd/system/wg-mesh-watchdog.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=WireGuard Mesh Watchdog Timer
+      After=wg-quick@wg-mesh.service
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=2min
+      AccuracySec=30s
+
+      [Install]
+      WantedBy=timers.target
+
+  # DHT metadata
+  - path: /etc/decloud/dht-metadata.json
+    permissions: '0644'
+    content: |
+      {
+        "node_id": "__NODE_ID__",
+        "vm_id": "__VM_ID__",
+        "vm_name": "__VM_NAME__",
+        "region": "__DHT_REGION__",
+        "listen_port": __DHT_LISTEN_PORT__,
+        "api_port": __DHT_API_PORT__,
+        "advertise_ip": "__WG_TUNNEL_IP__",
+        "wg_tunnel_ip": "__WG_TUNNEL_IP__",
+        "created_at": "__TIMESTAMP__",
+        "version": "6.0",
+        "connectivity": "wireguard-mesh"
+      }
+
+  # Nginx reverse proxy — port 80 → dashboard (8080) and DHT API
+  - path: /etc/nginx/sites-available/dht-proxy
+    permissions: '0644'
+    content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+
+          server_name _;
+
+          # Nginx-level health check (fast, no proxy)
+          location = /nginx-health {
+              return 200 "OK\n";
+              add_header Content-Type text/plain;
+          }
+
+          # Everything else → Python dashboard server (which proxies API and serves static files)
+          # This handles: /, /health, /peers, /diagnostics, /providers/, /static/
+          location / {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_connect_timeout 5s;
+              proxy_read_timeout 35s;  # 35s covers /providers/ 30s DHT walk
+          }
+      }
+
+  # DHT systemd service — starts AFTER WireGuard mesh is up
+  - path: /etc/systemd/system/decloud-dht.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud DHT Node (libp2p Kademlia)
+      After=network-online.target wg-quick@wg-mesh.service
+      Wants=network-online.target wg-quick@wg-mesh.service
+
+      [Service]
+      Type=simple
+      User=root
+      EnvironmentFile=/etc/decloud-dht/dht.env
+      ExecStart=/usr/local/bin/dht-node
+      Restart=always
+      RestartSec=5
+
+      # Hardening
+      ProtectSystem=strict
+      ReadWritePaths=/var/lib/decloud-dht
+      NoNewPrivileges=true
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # systemd drop-in: make wg-quick@wg-mesh idempotent
+  # Prevents "already exists" failure if the interface was brought up
+  # outside of systemd (e.g., during cloud-init enrollment).
+  - path: /etc/systemd/system/wg-quick@wg-mesh.service.d/override.conf
+    permissions: '0644'
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/bin/bash -c '/usr/local/bin/wg-mesh-enroll.sh || true'
+      RemainAfterExit=yes
+
+  # Dashboard server (Python — serves UI and proxies API to Go binary)
+  - path: /opt/decloud-dht/dht-dashboard.py
+    permissions: '0755'
+    content: |
+      __DHT_DASHBOARD_PY__
+
+  # Dashboard static files
+  - path: /opt/decloud-dht/static/dashboard.html
+    permissions: '0644'
+    content: |
+      __DHT_DASHBOARD_HTML__
+
+  - path: /opt/decloud-dht/static/dashboard.css
+    permissions: '0644'
+    content: |
+      __DHT_DASHBOARD_CSS__
+
+  - path: /opt/decloud-dht/static/dashboard.js
+    permissions: '0644'
+    content: |
+      __DHT_DASHBOARD_JS__
+
+  # Dashboard systemd service
+  - path: /etc/systemd/system/decloud-dht-dashboard.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud DHT Dashboard Server
+      After=decloud-dht.service nginx.service
+      Wants=decloud-dht.service nginx.service
+
+      [Service]
+      Type=simple
+      EnvironmentFile=/etc/decloud-dht/dht.env
+      ExecStart=/usr/bin/python3 /opt/decloud-dht/dht-dashboard.py
+      Restart=always
+      RestartSec=5
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Bootstrap poll service — polls orchestrator for peers
+  - path: /etc/systemd/system/decloud-dht-bootstrap-poll.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud DHT Bootstrap Peer Polling
+      After=decloud-dht.service network-online.target
+      Wants=decloud-dht.service network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/dht-bootstrap-poll.sh
+      Restart=always
+      RestartSec=15
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Bootstrap poll script
+  - path: /usr/local/bin/dht-bootstrap-poll.sh
+    permissions: '0755'
+    content: |
+      __DHT_BOOTSTRAP_POLL__
+
+# =====================================================
+# RUNTIME COMMANDS
+# =====================================================
+runcmd:
+  # QEMU guest agent (static unit — systemctl enable fails silently on Debian)
+  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+  - systemctl start qemu-guest-agent || true
+
+  # WireGuard mesh enrollment — polls NodeAgent until relay is assigned.
+  # Handles CGNAT nodes where CgnatInfo may not be available at deploy time.
+  # Also updates DHT_ADVERTISE_IP with the tunnel IP once obtained.
+  - |
+    export DECLOUD_ROLE=dht
+    export NODE_ID=__NODE_ID__
+    export VM_ID=__VM_ID__
+    /usr/local/bin/wg-config-fetch.sh
+
+  # Runtime data directory (not created by write_files)
+  - mkdir -p /var/lib/decloud-dht
+
+  # Single daemon-reload after all write_files are complete
+  - systemctl daemon-reload
+
+  # Nginx
+  - ln -sf /etc/nginx/sites-available/dht-proxy /etc/nginx/sites-enabled/
+  - rm -f /etc/nginx/sites-enabled/default
+  - nginx -t
+  - systemctl enable nginx && systemctl restart nginx
+
+  # DHT node
+  - systemctl enable decloud-dht && systemctl start decloud-dht
+
+  # Dashboard
+  - systemctl enable decloud-dht-dashboard && systemctl start decloud-dht-dashboard
+
+  # Bootstrap poll (primary orchestrator communication)
+  - systemctl enable decloud-dht-bootstrap-poll && systemctl start decloud-dht-bootstrap-poll
+
+  # Enable WireGuard watchdog timer
+  - systemctl enable wg-mesh-watchdog.timer
+  - systemctl start wg-mesh-watchdog.timer
+
+  # Log completion
+  - 'echo "DHT node __VM_ID__ ready at $(date) — region: __DHT_REGION__, tunnel: __WG_TUNNEL_IP__" >> /var/log/dht-bootstrap.log'
+
+final_message: "DeCloud DHT Node __VM_NAME__ is ready!"

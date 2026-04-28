@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeCloud Relay VM - __VM_NAME__</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <meta name="description" content="DeCloud Relay VM Management Dashboard">
+    <meta name="robots" content="noindex, nofollow">
+</head>
+<body>
+    <!-- Dashboard Container -->
+    <div class="dashboard-container">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <div class="header-left">
+                <h1 class="dashboard-title">
+                    <span class="icon">🌐</span>
+                    DeCloud Relay VM
+                </h1>
+                <div class="relay-metadata">
+                    <span class="metadata-item">
+                        <span class="label">ID:</span>
+                        <span class="value" id="relay-id">__VM_ID__</span>
+                    </span>
+                    <span class="metadata-item">
+                        <span class="label">Region:</span>
+                        <span class="value">__RELAY_REGION__</span>
+                    </span>
+                    <span class="metadata-item">
+                        <span class="label">Capacity:</span>
+                        <span class="value">__RELAY_CAPACITY__ nodes</span>
+                    </span>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="status-indicator">
+                    <span class="status-dot" id="overall-status"></span>
+                    <span class="status-text" id="status-text">Checking...</span>
+                </div>
+                <div class="last-update">
+                    Last update: <span id="last-update">Never</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Alert Banner -->
+        <div class="alert-banner" id="alert-banner" style="display: none;">
+            <span class="alert-icon">⚠️</span>
+            <span class="alert-message" id="alert-message"></span>
+            <button class="alert-close" onclick="closeAlert()">×</button>
+        </div>
+
+        <!-- Main Content Grid -->
+        <div class="content-grid">
+            <!-- Upstream Connections -->
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">🎯 Upstream Connections</h2>
+                    <span class="card-badge" id="upstream-count">0</span>
+                </div>
+                <div class="card-body">
+                    <!-- Orchestrator Connection (rendered by JS) -->
+                    <div id="orchestrator-connection">
+                        <div class="connection-item">
+                            <div class="connection-header">
+                                <span class="connection-status" data-status="checking"></span>
+                                <span class="connection-name">Checking...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Host Node Connection (rendered by JS) -->
+                    <div id="host-connection">
+                        <div class="connection-item">
+                            <div class="connection-header">
+                                <span class="connection-status" data-status="checking"></span>
+                                <span class="connection-name">Checking...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- CGNAT Nodes -->
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">📡 CGNAT Nodes</h2>
+                    <span class="card-badge">
+                        <span id="cgnat-capacity">0 / __RELAY_CAPACITY__</span>
+                    </span>
+                </div>
+                <div class="card-body">
+                    <!-- CGNAT nodes list (rendered by JS) -->
+                    <div id="cgnat-list">
+                        <p style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                            Loading...
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- System Metrics -->
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">📊 System Metrics</h2>
+                </div>
+                <div class="card-body">
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <div class="metric-label">Uptime</div>
+                            <div class="metric-value" id="uptime-value">-</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">CPU Usage</div>
+                            <div class="metric-value" id="cpu-value">-</div>
+                            <div class="metric-bar">
+                                <div class="metric-bar-fill" id="cpu-bar"></div>
+                            </div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Memory</div>
+                            <div class="metric-value" id="memory-value">-</div>
+                            <div class="metric-bar">
+                                <div class="metric-bar-fill" id="memory-bar"></div>
+                            </div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Data Received</div>
+                            <div class="metric-value" id="bandwidth-rx-value">0 B</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Data Transmitted</div>
+                            <div class="metric-value" id="bandwidth-tx-value">0 B</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- WireGuard Status -->
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">🔐 WireGuard Status</h2>
+                    <span class="card-badge" id="wg-status">DOWN</span>
+                </div>
+                <div class="card-body">
+                    <div class="wireguard-info">
+                        <div class="info-row">
+                            <span class="info-label">Interface:</span>
+                            <span class="info-value" id="wg-interface">wg-relay-server</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Listen Port:</span>
+                            <span class="info-value">51820</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Tunnel Network:</span>
+                            <span class="info-value">10.20.0.0/16</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Total Peers:</span>
+                            <span class="info-value" id="wg-peers">0</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Max Capacity:</span>
+                            <span class="info-value" id="wg-capacity">__RELAY_CAPACITY__</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Available Slots:</span>
+                            <span class="info-value" id="wg-available">__RELAY_CAPACITY__</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Cleanup Configuration (NEW) -->
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">🧹 Peer Cleanup</h2>
+                </div>
+                <div class="card-body">
+                    <div class="wireguard-info" id="cleanup-info">
+                        <div class="info-row">
+                            <span class="info-label">Status:</span>
+                            <span class="info-value">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Footer -->
+        <footer class="dashboard-footer">
+            <div class="footer-content">
+                <span class="footer-text">DeCloud Relay VM v1.1.0 (Enhanced)</span>
+                <span class="footer-separator">•</span>
+                <span class="footer-text" id="cgnat-count">0 CGNAT nodes</span>
+                <span class="footer-separator">•</span>
+                <a href="https://github.com/bekirmfr/DeCloud" class="footer-link" target="_blank">Documentation</a>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Loading dashboard...</div>
+    </div>
+
+    <!-- JavaScript -->
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

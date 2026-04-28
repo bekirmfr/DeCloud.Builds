@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeCloud Block Store - __VM_NAME__</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <style>
+        /* ── Diagnostics panel ── */
+        .diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.25rem; }
+        .diag-block { background: var(--bg-elevated); border: 1px solid var(--border-color); border-radius: var(--border-radius); padding: 1rem 1.2rem; }
+        .diag-block-title { font-size: 0.67rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 0.75rem; }
+        .diag-row { display: flex; justify-content: space-between; align-items: baseline; padding: 0.2rem 0; font-size: 0.8rem; border-bottom: 1px solid var(--border-subtle, rgba(255,255,255,0.05)); }
+        .diag-row:last-child { border-bottom: none; }
+        .diag-key { color: var(--text-muted); }
+        .diag-val { font-family: var(--font-mono); color: var(--text-primary); font-weight: 500; }
+        .diag-val.ok   { color: var(--status-online); }
+        .diag-val.warn { color: var(--warning); }
+        .diag-val.err  { color: var(--danger); }
+
+        /* ── Replication chain ── */
+        .chain-wrap { display: flex; align-items: flex-start; gap: 0; flex-wrap: wrap; margin-top: 0.5rem; }
+        .chain-step { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.85rem; border: 1px solid var(--border-color); border-radius: var(--border-radius); background: var(--bg-secondary); min-width: 140px; transition: border-color 0.3s; }
+        .chain-step.ok { border-color: var(--status-online); }
+        .chain-step.idle { border-color: var(--border-color); opacity: 0.6; }
+        .chain-num { width: 20px; height: 20px; border-radius: 50%; background: var(--bg-elevated); display: flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700; font-family: var(--font-mono); color: var(--text-muted); flex-shrink: 0; }
+        .chain-step.ok .chain-num { background: var(--status-online); color: #000; }
+        .chain-body { flex: 1; }
+        .chain-label  { font-size: 0.75rem; font-weight: 600; color: var(--text-primary); }
+        .chain-detail { font-size: 0.67rem; color: var(--text-muted); font-family: var(--font-mono); margin-top: 0.1rem; }
+        .chain-arrow  { font-size: 1rem; color: var(--text-muted); padding: 0 0.35rem; align-self: center; }
+
+        /* ── Event log ── */
+        .event-log { display: flex; flex-direction: column; gap: 1px; max-height: 420px; overflow-y: auto; }
+        .event-row { display: grid; grid-template-columns: 1.2rem 5rem 1fr auto; gap: 0.5rem; align-items: baseline; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.73rem; }
+        .event-row:hover { background: var(--bg-hover); }
+        .ev-icon { text-align: center; font-size: 0.7rem; }
+        .ev-ts   { font-family: var(--font-mono); color: var(--text-muted); font-size: 0.68rem; }
+        .ev-name { font-family: var(--font-mono); font-weight: 600; color: var(--text-primary); }
+        .ev-det  { font-family: var(--font-mono); color: var(--text-secondary); font-size: 0.68rem; word-break: break-all; }
+        .ev-key  { color: var(--text-muted); }
+        .ev-val  { color: var(--primary); }
+        .ev-error  .ev-name { color: var(--danger); }
+        .ev-warn   .ev-name { color: var(--warning); }
+        .ev-info   .ev-name { color: var(--info, #00a8ff); }
+        .ev-gossip .ev-name { color: #a78bfa; }
+        .empty-state-inline { text-align: center; color: var(--text-muted); padding: 1.5rem; font-size: 0.8rem; }
+
+        /* ── Export modal ── */
+        .export-btn { display: flex; align-items: center; gap: 0.4rem; padding: 0.4rem 0.9rem; border: 1px solid var(--border-color); border-radius: var(--border-radius); background: var(--bg-elevated); color: var(--text-secondary); font-size: 0.78rem; cursor: pointer; transition: all 0.2s; }
+        .export-btn:hover { border-color: var(--primary); color: var(--primary); }
+        .export-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 1000; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+        .export-overlay.open { opacity: 1; pointer-events: auto; }
+        .export-modal { background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--border-radius); width: min(900px, 94vw); max-height: 85vh; display: flex; flex-direction: column; overflow: hidden; }
+        .export-modal-head { display: flex; justify-content: space-between; align-items: center; padding: 0.85rem 1.1rem; border-bottom: 1px solid var(--border-color); }
+        .export-modal-title { font-weight: 700; font-size: 0.9rem; }
+        .export-head-actions { display: flex; gap: 0.5rem; align-items: center; }
+        .export-action-btn { padding: 0.35rem 0.8rem; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-elevated); color: var(--text-primary); font-size: 0.75rem; cursor: pointer; transition: all 0.15s; }
+        .export-action-btn:hover { border-color: var(--primary); color: var(--primary); }
+        .export-action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .export-close-btn { padding: 0.25rem 0.6rem; background: none; border: none; color: var(--text-muted); font-size: 1.1rem; cursor: pointer; }
+        .export-status-bar { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 1.1rem; background: var(--bg-primary); border-bottom: 1px solid var(--border-color); font-size: 0.75rem; }
+        .export-collect-btn { padding: 0.3rem 0.85rem; background: var(--primary); color: #000; border: none; border-radius: 6px; font-size: 0.75rem; font-weight: 600; cursor: pointer; }
+        .export-collect-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .export-body { display: grid; grid-template-columns: 200px 1fr; flex: 1; overflow: hidden; }
+        .export-sections { border-right: 1px solid var(--border-color); overflow-y: auto; padding: 0.5rem; }
+        .export-section-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.5rem; border-radius: 6px; }
+        .export-section-item:hover { background: var(--bg-hover); }
+        .export-sec-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; }
+        .export-sec-dot.done    { background: var(--status-online); }
+        .export-sec-dot.error   { background: var(--danger); }
+        .export-sec-dot.loading { background: var(--warning); animation: pulse 0.8s infinite; }
+        .export-sec-name { font-size: 0.75rem; flex: 1; }
+        .export-sec-size { font-size: 0.65rem; color: var(--text-muted); font-family: var(--font-mono); }
+        .export-preview-wrap { display: flex; flex-direction: column; overflow: hidden; }
+        .export-preview-label { padding: 0.4rem 0.8rem; font-size: 0.68rem; color: var(--text-muted); border-bottom: 1px solid var(--border-color); display: flex; gap: 0.5rem; }
+        .export-preview { flex: 1; overflow: auto; padding: 0.75rem; font-family: var(--font-mono); font-size: 0.7rem; line-height: 1.5; color: var(--text-secondary); white-space: pre; margin: 0; }
+        /* Toggle switch */
+        .tog { position: relative; display: inline-block; width: 30px; height: 17px; flex-shrink: 0; }
+        .tog input { opacity: 0; width: 0; height: 0; }
+        .tog-slider { position: absolute; inset: 0; cursor: pointer; background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 17px; transition: all 0.2s; }
+        .tog-slider::before { content: ''; position: absolute; width: 11px; height: 11px; left: 2px; top: 2px; border-radius: 50%; background: var(--text-muted); transition: all 0.2s; }
+        .tog input:checked + .tog-slider { background: var(--primary); border-color: var(--primary); }
+        .tog input:checked + .tog-slider::before { transform: translateX(13px); background: #000; }
+        /* Peer rows */
+        .peer-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0; border-bottom: 1px solid var(--border-subtle, rgba(255,255,255,0.04)); font-size: 0.78rem; }
+        .peer-row:last-child { border-bottom: none; }
+        .peer-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--status-online); flex-shrink: 0; }
+        .peer-id   { font-family: var(--font-mono); color: var(--text-primary); }
+        .peer-addr { font-family: var(--font-mono); color: var(--text-muted); font-size: 0.68rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+        .mono-sm { font-family: var(--font-mono); font-size: 0.75rem; }
+        /* Type badges */
+        .type-badge { padding: 0.15rem 0.5rem; border-radius: 20px; font-size: 0.65rem; font-weight: 600; }
+        .badge-vm    { background: rgba(0,212,170,0.15); color: var(--status-online); }
+        .badge-model { background: rgba(0,168,255,0.15); color: #00a8ff; }
+        .badge-lora  { background: rgba(167,139,250,0.15); color: #a78bfa; }
+        .badge-image { background: rgba(245,158,11,0.15); color: var(--warning); }
+        .badge-unk   { background: var(--bg-elevated); color: var(--text-muted); }
+        /* Resources table */
+        .resources-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+        .resources-table th { text-align: left; padding: 0.5rem 0.75rem; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.7px; color: var(--text-muted); border-bottom: 1px solid var(--border-color); }
+        .resources-table td { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border-subtle, rgba(255,255,255,0.04)); }
+        .resources-table tr:last-child td { border-bottom: none; }
+        .resources-table tr:hover td { background: var(--bg-hover); }
+        .res-id { font-family: var(--font-mono); font-size: 0.73rem; }
+    </style>
+    <meta name="robots" content="noindex, nofollow">
+</head>
+<body>
+    <div class="dashboard-container">
+
+        <!-- Header -->
+        <header class="dashboard-header">
+            <div class="header-left">
+                <h1 class="dashboard-title">
+                    <span class="icon">&#x1f4be;</span>
+                    DeCloud Block Store
+                </h1>
+                <div class="relay-metadata">
+                    <span class="metadata-item"><span class="label">VM:</span> <span class="value" id="vm-id">__VM_ID__</span></span>
+                    <span class="metadata-item"><span class="label">Region:</span> <span class="value">__NODE_REGION__</span></span>
+                    <span class="metadata-item"><span class="label">Node:</span> <span class="value">__NODE_ID__</span></span>
+                </div>
+            </div>
+            <div class="header-right">
+                <button class="export-btn" onclick="openExport()" title="Export full diagnostic snapshot">
+                    &#x2B07; Export
+                </button>
+                <div class="status-indicator">
+                    <div class="status-dot checking" id="overall-status"></div>
+                    <span class="status-text" id="status-text">Checking...</span>
+                </div>
+                <div class="last-update" id="last-update">—</div>
+            </div>
+        </header>
+
+        <!-- Alert Banner -->
+        <div class="alert-banner" id="alert-banner" style="display: none;">
+            <span class="alert-icon">&#x26a0;</span>
+            <span class="alert-message" id="alert-message"></span>
+            <button class="alert-close" onclick="closeAlert()">&#x2715;</button>
+        </div>
+
+        <!-- Row 1: Storage + Identity -->
+        <div class="content-grid">
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">&#x1f4be; Storage</h2>
+                    <span class="card-badge" id="usage-badge">—</span>
+                </div>
+                <div class="card-body">
+                    <div class="storage-bar-wrap">
+                        <div class="storage-bar-track">
+                            <div class="storage-bar-fill" id="storage-bar"></div>
+                        </div>
+                        <div class="storage-bar-labels">
+                            <span id="used-label">—</span>
+                            <span id="capacity-label">—</span>
+                        </div>
+                    </div>
+                    <div class="metrics-grid" style="margin-top: 1.5rem;">
+                        <div class="metric-item">
+                            <div class="metric-label">Blocks Stored</div>
+                            <div class="metric-value" id="block-count">—</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Manifests</div>
+                            <div class="metric-value" id="manifest-count">—</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Bitswap &#x2b06;</div>
+                            <div class="metric-value" id="bitswap-sent">—</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-label">Bitswap &#x2b07;</div>
+                            <div class="metric-value" id="bitswap-received">—</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="card">
+                <div class="card-header">
+                    <h2 class="card-title">&#x1f194; Node Identity</h2>
+                </div>
+                <div class="card-body">
+                    <div class="wireguard-info">
+                        <div class="info-row"><span class="info-label">Peer ID</span>  <span class="info-value" id="peer-id">—</span></div>
+                        <div class="info-row"><span class="info-label">Peers</span>     <span class="info-value" id="connected-peers">—</span></div>
+                        <div class="info-row"><span class="info-label">Uptime</span>    <span class="info-value" id="uptime-value">—</span></div>
+                        <div class="info-row"><span class="info-label">Advertise IP</span> <span class="info-value" id="advertise-ip">__BLOCKSTORE_ADVERTISE_IP__</span></div>
+                        <div class="info-row"><span class="info-label">Region</span>    <span class="info-value" id="node-region">__NODE_REGION__</span></div>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Row 2: Diagnostics stats -->
+        <section class="card" style="margin-top: 1.5rem;">
+            <div class="card-header">
+                <h2 class="card-title">&#x1f527; Diagnostics</h2>
+                <span id="diag-status" style="font-size:0.75rem;color:var(--text-muted)"></span>
+            </div>
+            <div class="card-body">
+                <div class="diag-grid">
+                    <!-- GossipSub -->
+                    <div class="diag-block">
+                        <div class="diag-block-title">&#x1f4e8; GossipSub</div>
+                        <div class="diag-row"><span class="diag-key">Topics</span>       <span class="diag-val" id="diag-gs-topics">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Published</span>    <span class="diag-val" id="diag-gs-published">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Received</span>     <span class="diag-val" id="diag-gs-received">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Last TX</span>      <span class="diag-val" id="diag-gs-last-tx">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Last RX</span>      <span class="diag-val" id="diag-gs-last-rx">—</span></div>
+                    </div>
+                    <!-- DHT Announce -->
+                    <div class="diag-block">
+                        <div class="diag-block-title">&#x1f4e1; DHT Announce</div>
+                        <div class="diag-row"><span class="diag-key">Success</span>      <span class="diag-val ok"  id="diag-dht-ok">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Failed</span>       <span class="diag-val err" id="diag-dht-fail">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Last at</span>      <span class="diag-val" id="diag-dht-last">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Reannounces</span> <span class="diag-val" id="diag-dht-reannounce">—</span></div>
+                    </div>
+                    <!-- XOR Decisions -->
+                    <div class="diag-block">
+                        <div class="diag-block-title">&#x2220; XOR Pull Decisions</div>
+                        <div class="diag-row"><span class="diag-key">Accepted</span>  <span class="diag-val ok"  id="diag-xor-accepted">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Rejected</span>  <span class="diag-val" id="diag-xor-rejected">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Accept rate</span> <span class="diag-val" id="diag-xor-rate">—</span></div>
+                    </div>
+                    <!-- Bitswap -->
+                    <div class="diag-block">
+                        <div class="diag-block-title">&#x21c4; Bitswap</div>
+                        <div class="diag-row"><span class="diag-key">Received</span> <span class="diag-val" id="diag-bs-received">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Sent</span>     <span class="diag-val" id="diag-bs-sent">—</span></div>
+                    </div>
+                    <!-- GC -->
+                    <div class="diag-block">
+                        <div class="diag-block-title">&#x267b; Garbage Collection</div>
+                        <div class="diag-row"><span class="diag-key">GC Runs</span>      <span class="diag-val" id="diag-gc-runs">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Blocks Evicted</span> <span class="diag-val" id="diag-gc-evicted">—</span></div>
+                        <div class="diag-row"><span class="diag-key">Bytes Freed</span>  <span class="diag-val" id="diag-gc-freed">—</span></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Row 3: Replication Chain -->
+        <section class="card" style="margin-top: 1.5rem;">
+            <div class="card-header">
+                <h2 class="card-title">&#x1f517; Replication Chain</h2>
+                <span style="font-size:0.72rem;color:var(--text-muted)">Local write → DHT announce → GossipSub → Remote pull → Bitswap</span>
+            </div>
+            <div class="card-body">
+                <div class="chain-wrap" id="replication-chain">
+                    <p class="empty-state-inline">Loading chain status...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Row 4: Resources Table -->
+        <section class="card" style="margin-top: 1.5rem;">
+            <div class="card-header">
+                <h2 class="card-title">&#x1f4e6; Stored Resources</h2>
+                <span class="card-badge" id="resource-count-badge">0</span>
+            </div>
+            <div class="card-body" style="padding: 0;">
+                <div id="resources-table-wrap">
+                    <p class="empty-state-inline">Loading resources...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Row 5: Event Log -->
+        <section class="card" style="margin-top: 1.5rem;">
+            <div class="card-header">
+                <h2 class="card-title">&#x1f4dd; Event Log</h2>
+                <span class="card-badge" id="event-count-badge">0</span>
+            </div>
+            <div class="card-body" style="padding: 0.5rem 0;">
+                <div class="event-log" id="event-log">
+                    <p class="empty-state-inline">Loading events...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Row 6: Connected Peers -->
+        <section class="card" style="margin-top: 1.5rem;">
+            <div class="card-header">
+                <h2 class="card-title">&#x1f4e1; Connected Peers</h2>
+                <span class="card-badge" id="peer-count-badge">0</span>
+            </div>
+            <div class="card-body">
+                <div id="peers-list">
+                    <p class="empty-state-inline">Loading peers...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="dashboard-footer">
+            <div class="footer-content">
+                <span class="footer-text">DeCloud Block Store v2.0</span>
+                <span class="footer-separator">&#x2022;</span>
+                <span class="footer-text" id="footer-peers">0 peers</span>
+                <span class="footer-separator">&#x2022;</span>
+                <span class="footer-text">Region: __NODE_REGION__</span>
+                <span class="footer-separator">&#x2022;</span>
+                <span class="footer-text" id="footer-storage">Storage: —</span>
+                <span class="footer-separator">&#x2022;</span>
+                <span class="footer-text" id="footer-blocks">0 blocks</span>
+            </div>
+        </footer>
+
+    </div><!-- /dashboard-container -->
+
+    <!-- Export Modal -->
+    <div id="export-overlay" class="export-overlay" onclick="closeExportOnBackdrop(event)">
+        <div class="export-modal">
+            <div class="export-modal-head">
+                <span class="export-modal-title">&#x1f4ca; Diagnostic Snapshot</span>
+                <div class="export-head-actions">
+                    <button class="export-action-btn" id="export-copy-btn" onclick="exportCopy()" disabled>Copy JSON</button>
+                    <button class="export-action-btn" id="export-dl-btn"   onclick="exportDownload()" disabled>Download JSON</button>
+                    <button class="export-close-btn" onclick="closeExport()">&#x2715;</button>
+                </div>
+            </div>
+            <div class="export-status-bar" id="export-status-bar">
+                <span id="export-status-text">Click Collect to fetch a fresh snapshot</span>
+                <button class="export-collect-btn" id="export-collect-btn" onclick="collectExport()">Collect All Data</button>
+            </div>
+            <div class="export-body">
+                <div class="export-sections" id="export-sections">
+                    <div style="padding:1rem;font-size:0.75rem;color:var(--text-muted)">
+                        Click <strong style="color:var(--text-primary)">Collect All Data</strong> to fetch a fresh snapshot, then copy or download.
+                    </div>
+                </div>
+                <div class="export-preview-wrap">
+                    <div class="export-preview-label">JSON Preview <span id="export-preview-size"></span></div>
+                    <pre class="export-preview" id="export-preview">—</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Loading Block Store dashboard...</div>
+    </div>
+
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+﻿# Default — auto-detect
+* text=auto
+
+# Shell scripts — must be LF on Linux VMs, never CRLF
+*.sh text eol=lf
+
+# Python scripts — LF
+*.py text eol=lf
+
+# Go source — LF
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+
+# YAML — LF
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Web assets — LF
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+
+# Markdown and docs
+*.md text eol=lf
+
+# Binary files — no line ending conversion
+*.gz binary
+*.b64 binary
+*.png binary
+*.jpg binary
