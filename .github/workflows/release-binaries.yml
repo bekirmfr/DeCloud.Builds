@@ -121,7 +121,7 @@ jobs:
 
     defaults:
       run:
-        cache-dependency-path: system-vms/blockstore/blockstore-node-src/go.sum
+        working-directory: system-vms/blockstore/blockstore-node-src
 
     steps:
       - name: Checkout
@@ -132,8 +132,7 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: true
-          cache-dependency-path: >-
-            src/DeCloud.NodeAgent/CloudInit/Templates/blockstore-vm/blockstore-node-src/go.sum
+          cache-dependency-path: system-vms/blockstore/blockstore-node-src/go.sum
 
       - name: Build
         env:
