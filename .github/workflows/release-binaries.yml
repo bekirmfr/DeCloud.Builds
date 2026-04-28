@@ -42,6 +42,8 @@ on:
 
 permissions:
   contents: write   # required to create releases and upload assets
+  env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ── Build DHT node ──────────────────────────────────────────────────────────
@@ -230,8 +232,8 @@ jobs:
             echo ""
             git log --oneline $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD \
               -- \
-              'src/DeCloud.NodeAgent/CloudInit/Templates/dht-vm/dht-node-src/**' \
-              'src/DeCloud.NodeAgent/CloudInit/Templates/blockstore-vm/blockstore-node-src/**' \
+              'system-vms/dht/dht-node-src/**' \
+              'system-vms/blockstore/blockstore-node-src/**' \
               2>/dev/null | head -20 || echo "_First release._"
           } > release-notes.md
 
