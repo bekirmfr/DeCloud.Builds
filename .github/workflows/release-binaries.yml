@@ -42,7 +42,8 @@ on:
 
 permissions:
   contents: write   # required to create releases and upload assets
-  env:
+  
+env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
