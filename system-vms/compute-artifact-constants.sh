@@ -2,53 +2,48 @@
 # ============================================================
 # system-vms/compute-artifact-constants.sh
 #
-# Discovers every file under system-vms/{role}/assets/ and
-# system-vms/shared/assets/, then outputs a C# file containing
-# the SHA256 and data: URI constants needed by SystemVmTemplateSeeder.cs.
+# Auto-discovers every {role}/assets/ directory under system-vms/,
+# computes SHA256 + data: URI for each file, and outputs a C# file
+# containing the constants needed by SystemVmTemplateSeeder.cs.
+#
+# No hardcoded role lists or prefix maps. Adding a new role to
+# system-vms/ automatically includes it — no script changes needed.
 #
 # Usage (run from system-vms/ directory):
 #   bash compute-artifact-constants.sh
 #
 # Output:
-#   artifact-constants.cs   ← paste relevant sections into
-#                              SystemVmTemplateSeeder.cs, then bump
-#                              the affected TemplateRevision constant.
+#   artifact-constants.cs
 #
-# Expected directory layout:
-#   system-vms/
-#     compute-artifact-constants.sh   ← this file
-#     shared/
-#       assets/
-#         wg-mesh-enroll.sh
-#         wg-config-fetch.sh
-#     dht/
-#       src/            ← Go source (not processed here)
-#       assets/
-#         dht-dashboard.py
-#         dashboard.html
-#         ...
-#       cloud-init.yaml
-#     blockstore/
-#       src/
-#       assets/
-#         ...
-#       cloud-init.yaml
-#     relay/
-#       assets/
-#         relay-api.py
-#         ...
-#       cloud-init.yaml
+# Naming convention  —  {RolePrefix}{FileStem}{ExtSuffix}
 #
-# Constant naming convention:
-#   {Role}{FileStem}{Ext?}
-#   Role is title-cased: Shared, Dht, Blockstore, Relay
-#   FileStem is camel-cased from the filename (dashes/dots → camelCase)
-#   Ext is omitted for .sh; included for ambiguous types (.py → Py, .html → Html)
-#   Examples:
-#     shared/assets/wg-mesh-enroll.sh   → WgMeshEnroll{Sha256,DataUri}
-#     dht/assets/dht-dashboard.py       → DhtDashboardPy{Sha256,DataUri}
-#     dht/assets/dashboard.html         → DhtDashboardHtml{Sha256,DataUri}
-#     blockstore/assets/dashboard.css   → BlockstoreDashboardCss{Sha256,DataUri}
+#   RolePrefix:
+#     Directory named "shared" → empty prefix (scripts identified by name alone)
+#     Any other directory      → PascalCase(directory name)
+#                                e.g. "dht" → "Dht", "blockstore" → "Blockstore"
+#
+#   FileStem:
+#     PascalCase of the filename stem, with the role name stripped if the
+#     filename already begins with it — avoids doubled prefixes.
+#     e.g. "dht-dashboard.py" in dht/ → stem "dashboard" → "DhtDashboardPy"
+#          "dashboard.html"   in dht/ → stem "dashboard" → "DhtDashboardHtml"
+#          "wg-mesh-enroll.sh" in shared/ → "WgMeshEnroll"
+#
+#   ExtSuffix:
+#     .sh  → omitted (implied by Script ArtifactType)
+#     .py  → Py
+#     .html → Html
+#     .css  → Css
+#     .js   → Js
+#     other → title-cased extension
+#
+#   Full examples:
+#     shared/assets/wg-mesh-enroll.sh          → WgMeshEnroll
+#     dht/assets/dht-dashboard.py              → DhtDashboardPy
+#     dht/assets/dashboard.html               → DhtDashboardHtml
+#     blockstore/assets/blockstore-notify-ready.sh → BlockstoreNotifyReady
+#     relay/assets/relay-api.py               → RelayApiPy
+#     relay/assets/notify-nat-ready.sh        → RelayNotifyNatReady
 # ============================================================
 
 set -euo pipefail
@@ -56,12 +51,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT="${SCRIPT_DIR}/artifact-constants.cs"
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Pure functions ────────────────────────────────────────────────────────────
 
-# Detect media type from file extension
+# Infer MIME type from file extension.
 media_type() {
-    local file="$1"
-    case "${file##*.}" in
+    case "${1##*.}" in
         sh)         echo "text/x-sh" ;;
         py)         echo "text/x-python" ;;
         html)       echo "text/html" ;;
@@ -75,55 +69,84 @@ media_type() {
         svg)        echo "image/svg+xml" ;;
         ico)        echo "image/x-icon" ;;
         gif)        echo "image/gif" ;;
+        webp)       echo "image/webp" ;;
         *)          echo "application/octet-stream" ;;
     esac
 }
 
-# Convert a filename to a C# PascalCase identifier segment.
-# Rules:
-#   - Split on dashes, dots, and underscores
-#   - Title-case each segment
-#   - Omit .sh extension (implied by Script type)
-#   - Keep other extensions as a suffix (Py, Html, Css, Js, Json, etc.)
-# Examples:
-#   wg-mesh-enroll.sh   → WgMeshEnroll   (no Sh suffix)
-#   dht-dashboard.py    → DhtDashboardPy
-#   dashboard.html      → DashboardHtml
-#   relay-api.py        → RelayApiPy
-filename_to_pascal() {
-    local filename="$1"
-    local ext="${filename##*.}"
-    local stem="${filename%.*}"
-
-    # Split on dash, dot, underscore → title-case each segment
+# Convert a dash/dot/underscore-separated string to PascalCase.
+# e.g. "wg-mesh-enroll" → "WgMeshEnroll"
+#      "dht-dashboard"  → "DhtDashboard"
+to_pascal() {
+    local input="$1"
     local result=""
-    IFS='-._' read -ra parts <<< "$stem"
+    IFS='-._' read -ra parts <<< "$input"
     for part in "${parts[@]}"; do
-        if [ -n "$part" ]; then
-            result+="$(echo "${part:0:1}" | tr '[:lower:]' '[:upper:]')${part:1}"
-        fi
+        [ -n "$part" ] || continue
+        result+="$(echo "${part:0:1}" | tr '[:lower:]' '[:upper:]')${part:1}"
     done
-
-    # Append extension segment (except .sh — it's implied)
-    if [ "$ext" != "sh" ] && [ -n "$ext" ]; then
-        result+="$(echo "${ext:0:1}" | tr '[:lower:]' '[:upper:]')${ext:1}"
-    fi
-
     echo "$result"
 }
 
-# Title-case a role directory name for use as C# prefix.
-# dht → Dht, blockstore → Blockstore, shared → Shared, relay → Relay
-role_prefix() {
+# Derive the C# role prefix from a directory name.
+# "shared" is the only special case — it produces an empty prefix
+# because shared scripts are identified by their own name alone.
+# All other directories produce PascalCase(name).
+role_to_prefix() {
     local role="$1"
-    echo "$(echo "${role:0:1}" | tr '[:lower:]' '[:upper:]')${role:1}"
+    if [ "$role" = "shared" ]; then
+        echo ""
+    else
+        to_pascal "$role"
+    fi
 }
 
-# Emit one constant pair (Sha256 + DataUri) for a single file.
+# Derive the C# constant name for one file in one role.
+#
+# Algorithm:
+#   1. Split filename into stem and extension.
+#   2. Strip the role name from the beginning of the stem if present,
+#      followed by a separator (dash/underscore). This removes the
+#      redundant role prefix that many filenames carry.
+#      e.g. role=dht, stem=dht-dashboard → dashboard
+#           role=relay, stem=relay-api   → api
+#           role=dht, stem=dashboard     → dashboard  (no match, unchanged)
+#   3. Convert the remaining stem to PascalCase.
+#   4. Append the extension suffix (omit for .sh).
+#   5. Prepend the role prefix.
+file_const_name() {
+    local filename="$1"
+    local role="$2"
+    local prefix="$3"
+
+    local ext="${filename##*.}"
+    local stem="${filename%.*}"
+    local stem_lower ext_lower role_lower
+    stem_lower=$(echo "$stem"  | tr '[:upper:]' '[:lower:]')
+    role_lower=$(echo "$role"  | tr '[:upper:]' '[:lower:]')
+
+    # Strip role prefix from stem when filename starts with "{role}-" or "{role}_"
+    if [[ "$stem_lower" == "${role_lower}-"* || "$stem_lower" == "${role_lower}_"* ]]; then
+        stem="${stem:$(( ${#role} + 1 ))}"
+    fi
+
+    local stem_pascal
+    stem_pascal=$(to_pascal "$stem")
+
+    # Extension suffix — omit for shell scripts
+    local ext_suffix=""
+    if [ "$ext" != "sh" ] && [ -n "$ext" ]; then
+        ext_suffix="$(echo "${ext:0:1}" | tr '[:lower:]' '[:upper:]')${ext:1}"
+    fi
+
+    echo "${prefix}${stem_pascal}${ext_suffix}"
+}
+
+# Write one constant pair (Sha256 + DataUri) for a file.
 emit_constant() {
-    local const_name="$1"   # e.g. DhtDashboardPy
-    local file="$2"         # absolute path
-    local rel_path="$3"     # relative path for comment
+    local const_name="$1"
+    local file="$2"
+    local rel_path="$3"
 
     local sha256 b64 size mime
     sha256=$(sha256sum "$file" | awk '{print $1}')
@@ -132,17 +155,43 @@ emit_constant() {
     mime=$(media_type "$file")
 
     cat >> "$OUTPUT" << EOF
-    // ${rel_path}  (${size} bytes, ${mime})
+    // ${rel_path}  (${size} bytes)
     private const string ${const_name}Sha256  = "${sha256}";
     private const string ${const_name}DataUri = "data:${mime};base64,${b64}";
 
 EOF
 }
 
+# ── Discover roles ────────────────────────────────────────────────────────────
+# Find every directory directly under system-vms/ that contains an assets/ subdirectory.
+# Sort so "shared" comes first (its scripts are referenced by all other roles),
+# then remaining roles in alphabetical order.
+
+discover_roles() {
+    local roles=()
+    local others=()
+
+    while IFS= read -r -d '' assets_dir; do
+        local role
+        role=$(basename "$(dirname "$assets_dir")")
+        if [ "$role" = "shared" ]; then
+            roles=("shared" "${roles[@]+"${roles[@]}"}")
+        else
+            others+=("$role")
+        fi
+    done < <(find "$SCRIPT_DIR" -mindepth 2 -maxdepth 2 -name "assets" -type d -print0 | sort -z)
+
+    # Sort the non-shared roles alphabetically for deterministic output
+    IFS=$'\n' sorted_others=($(printf '%s\n' "${others[@]+"${others[@]}"}" | sort))
+    unset IFS
+
+    echo "${roles[@]+"${roles[@]}"} ${sorted_others[@]+"${sorted_others[@]}"}"
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-{
-cat << 'HEADER'
+# File header
+cat > "$OUTPUT" << 'HEADER'
 // ============================================================
 // artifact-constants.cs  —  AUTO-GENERATED
 // Run: bash system-vms/compute-artifact-constants.sh
@@ -155,57 +204,49 @@ cat << 'HEADER'
 // ============================================================
 
 // Paste this block inside the SystemVmTemplateSeeder class body.
-// Replace the COMPUTE_FROM_FILE placeholders with the values below.
+// Replace the COMPUTE_FROM_FILE placeholders with the generated values.
 
 HEADER
-} > "$OUTPUT"
 
-TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-echo "// Generated: ${TIMESTAMP}" >> "$OUTPUT"
+echo "// Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$OUTPUT"
 echo "" >> "$OUTPUT"
 
-# Track which roles had assets (for summary)
-declare -A role_counts
 total_files=0
 errors=0
+declare -A role_counts
+declare -A role_prefixes
+declare -A role_names_generated  # for the summary
 
-# Process roles in a defined order: shared first (used by multiple roles),
-# then per-role in alphabetical order.
-ROLES=("shared" "dht" "blockstore" "relay")
+# Read discovered roles into array
+read -ra ROLES <<< "$(discover_roles)"
 
 for role in "${ROLES[@]}"; do
     assets_dir="${SCRIPT_DIR}/${role}/assets"
+    [ -d "$assets_dir" ] || continue
 
-    if [ ! -d "$assets_dir" ]; then
-        echo "// [skipped ${role}/assets — directory not found]" >> "$OUTPUT"
-        echo "" >> "$OUTPUT"
-        continue
-    fi
-
-    prefix=$(role_prefix "$role")
+    prefix=$(role_to_prefix "$role")
     role_file_count=0
+    role_names=()
 
-    echo "// ── ${prefix} ─────────────────────────────────────────────────────────" >> "$OUTPUT"
+    # Section header
+    section="${prefix:-Shared}"
+    echo "// ── ${section} ────────────────────────────────────────────────────────────────" >> "$OUTPUT"
 
-    # Find all files, sorted for deterministic output.
-    # Exclude hidden files, backup files, and the compute script itself.
     while IFS= read -r -d '' file; do
         filename=$(basename "$file")
 
-        # Skip hidden files, backup files, compiled outputs
+        # Skip hidden files, Python bytecode, backup files
         case "$filename" in
-            .* | *~ | *.pyc | *.pyo | __pycache__) continue ;;
+            .* | *~ | *.pyc | *.pyo) continue ;;
         esac
 
         rel_path="${role}/assets/${filename}"
+        const_name=$(file_const_name "$filename" "$role" "$prefix")
 
-        # Derive constant name: {RolePrefix}{FileStem}
-        file_pascal=$(filename_to_pascal "$filename")
-        const_name="${prefix}${file_pascal}"
-
-        if emit_constant "$const_name" "$file" "$rel_path"; then
+        if emit_constant "$const_name" "$file" "$rel_path" 2>/dev/null; then
             role_file_count=$((role_file_count + 1))
             total_files=$((total_files + 1))
+            role_names+=("${const_name}")
         else
             echo "  ERROR processing: $rel_path" >&2
             errors=$((errors + 1))
@@ -219,37 +260,38 @@ for role in "${ROLES[@]}"; do
     fi
 
     role_counts["$role"]=$role_file_count
+    role_prefixes["$role"]="${prefix:-<none>}"
+    role_names_generated["$role"]="${role_names[*]+"${role_names[*]}"}"
 done
 
-# ── Summary comment ──────────────────────────────────────────────────────────
-
+# Summary comment in output file
 {
 echo ""
-echo "// ── Summary ─────────────────────────────────────────────────────────────"
-echo "// Generated: ${TIMESTAMP}"
-echo "// Files processed:"
+echo "// ── Summary ─────────────────────────────────────────────────────────────────"
+echo "// Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo "// Roles discovered:"
 for role in "${ROLES[@]}"; do
-    count="${role_counts[$role]:-0}"
-    echo "//   ${role}/assets/: ${count} files"
+    echo "//   ${role}/assets/ [prefix='${role_prefixes[$role]:-}']: ${role_counts[$role]:-0} files"
 done
 echo "// Total: ${total_files} artifact constants"
-if [ "$errors" -gt 0 ]; then
-    echo "// ERRORS: ${errors} files failed to process — check output above"
-fi
+[ "$errors" -gt 0 ] && echo "// ERRORS: ${errors} files failed to process"
 } >> "$OUTPUT"
 
-# ── Console output ───────────────────────────────────────────────────────────
+# ── Console output ────────────────────────────────────────────────────────────
 
 echo ""
 echo "✓ artifact-constants.cs written (${total_files} artifacts)"
 echo ""
-echo "Roles processed:"
+
 for role in "${ROLES[@]}"; do
     count="${role_counts[$role]:-0}"
-    if [ "$count" -gt 0 ]; then
-        echo "  ${role}/assets/: ${count} files"
-    else
-        echo "  ${role}/assets/: (none found)"
+    prefix="${role_prefixes[$role]:-<none>}"
+    names="${role_names_generated[$role]:-}"
+    echo "  ${role}/assets/ [prefix='${prefix}']: ${count} files"
+    if [ -n "$names" ]; then
+        # Print names wrapped at ~80 chars
+        echo "    $(echo "$names" | tr ' ' '\n' | awk '{printf "%s, ", $0} NR%4==0{print ""}' | sed 's/, $//')"
+        echo ""
     fi
 done
 
@@ -259,9 +301,8 @@ if [ "$errors" -gt 0 ]; then
     exit 1
 fi
 
-echo ""
 echo "Next steps:"
 echo "  1. Open artifact-constants.cs"
-echo "  2. Copy the updated constant pairs into SystemVmTemplateSeeder.cs"
+echo "  2. Copy updated constant pairs into SystemVmTemplateSeeder.cs"
 echo "  3. Bump the affected TemplateRevision constant"
 echo "  4. Commit to the Orchestrator repo"
