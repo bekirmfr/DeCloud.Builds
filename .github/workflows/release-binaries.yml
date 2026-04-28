@@ -64,7 +64,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: system-vms/dht/dht-node-src
+        working-directory: system-vms/dht/src
 
     steps:
       - name: Checkout
@@ -75,7 +75,7 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: true
-          cache-dependency-path: system-vms/dht/dht-node-src/go.sum
+          cache-dependency-path: system-vms/dht/src/go.sum
 
       - name: Build
         env:
@@ -103,8 +103,8 @@ jobs:
         with:
           name: dht-node-${{ matrix.arch }}
           path: |
-            system-vms/dht/dht-node-src/dht-node-${{ matrix.arch }}
-            system-vms/dht/dht-node-src/dht-node-${{ matrix.arch }}.sha256
+            system-vms/dht/src/dht-node-${{ matrix.arch }}
+            system-vms/dht/src/dht-node-${{ matrix.arch }}.sha256
           retention-days: 1
 
   # ── Build BlockStore node ────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: system-vms/blockstore/blockstore-node-src
+        working-directory: system-vms/blockstore/src
 
     steps:
       - name: Checkout
@@ -135,7 +135,7 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: true
-          cache-dependency-path: system-vms/blockstore/blockstore-node-src/go.sum
+          cache-dependency-path: system-vms/blockstore/src/go.sum
 
       - name: Build
         env:
@@ -163,8 +163,8 @@ jobs:
         with:
           name: blockstore-node-${{ matrix.arch }}
           path: |
-            system-vms/blockstore/blockstore-node-src/blockstore-node-${{ matrix.arch }}
-            system-vms/blockstore/blockstore-node-src/blockstore-node-${{ matrix.arch }}.sha256
+            system-vms/blockstore/src/blockstore-node-${{ matrix.arch }}
+            system-vms/blockstore/src/blockstore-node-${{ matrix.arch }}.sha256
           retention-days: 1
 
   # ── Create GitHub Release ────────────────────────────────────────────────────
@@ -233,8 +233,8 @@ jobs:
             echo ""
             git log --oneline $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD \
               -- \
-              'system-vms/dht/dht-node-src/**' \
-              'system-vms/blockstore/blockstore-node-src/**' \
+              'system-vms/dht/src/**' \
+              'system-vms/blockstore/src/**' \
               2>/dev/null | head -20 || echo "_First release._"
           } > release-notes.md
 
