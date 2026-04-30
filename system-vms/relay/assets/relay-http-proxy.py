@@ -16,8 +16,20 @@ import urllib.error
 from threading import Thread, Lock
 
 # Configuration
+# Configuration
+# Runtime config read from relay-metadata.json (written by cloud-init write_files
+# with full substitution). Artifacts in the pipeline are never substituted.
+def _load_relay_metadata():
+    try:
+        import json as _json
+        with open('/etc/decloud/relay-metadata.json', 'r') as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+_meta = _load_relay_metadata()
 ORCHESTRATOR_URL = os.environ.get('ORCHESTRATOR_URL', 'http://10.20.0.1:5000')
-RELAY_ID = os.environ.get('RELAY_ID', '__NODE_ID__')
+RELAY_ID = _meta.get('relay_id', 'unknown')
 RELAY_TOKEN_FILE = '/etc/wireguard/private.key'
 LISTEN_PORT = 8081
 ROUTING_CACHE_TTL = 30  # seconds

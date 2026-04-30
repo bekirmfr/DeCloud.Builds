@@ -25,11 +25,22 @@ from urllib.parse import urlparse, parse_qs
 import sys
 
 # ==================== Configuration ====================
-RELAY_ID = "__VM_ID__"
-RELAY_NAME = "__VM_NAME__"
-RELAY_REGION = "__RELAY_REGION__"
-RELAY_CAPACITY = int("__RELAY_CAPACITY__")
-NODE_ID = "__NODE_ID__"  # Relay host's node ID (for detecting host system VMs)
+# Runtime config is read from relay-metadata.json, which is written by
+# cloud-init write_files with full placeholder substitution. Artifacts
+# delivered via the pipeline are never processed by cloud-init substitution.
+def _load_relay_metadata():
+    try:
+        with open('/etc/decloud/relay-metadata.json', 'r') as f:
+            import json as _json
+            return _json.load(f)
+    except Exception:
+        return {}
+
+_meta = _load_relay_metadata()
+RELAY_ID       = _meta.get('relay_id', 'unknown')
+RELAY_NAME     = _meta.get('relay_name', 'relay-unknown')
+RELAY_REGION   = _meta.get('region', 'default')
+RELAY_CAPACITY = int(_meta.get('max_capacity', 10))
 WIREGUARD_INTERFACE = "wg-relay-server"
 STATIC_DIR = "/opt/decloud-relay/static"
 LISTEN_PORT = 8080
