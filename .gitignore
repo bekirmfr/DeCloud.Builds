@@ -2,8 +2,6 @@
 # Compiled binaries (raw and encoded)
 **/**/src/*-amd64
 **/**/src/*-arm64
-system-vms/blockstore/src/blockstore-node-amd64
-system-vms/blockstore/src/blockstore-node-arm64
 
 # Encoded build artifacts (old gz+b64 format — not used in new pipeline)
 **/*.gz.b64
