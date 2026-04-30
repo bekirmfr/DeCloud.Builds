@@ -23,9 +23,9 @@ const CONFIG = {
 
     // API endpoints
     api: {
-        wireguard: '/api/relay/wireguard',
-        status: '/api/relay/status',
-        cleanupStats: '/api/relay/cleanup/stats'
+        wireguard: 'api/relay/wireguard',
+        status: 'api/relay/status',
+        cleanupStats: 'api/relay/cleanup/stats'
     },
 
     // Thresholds
