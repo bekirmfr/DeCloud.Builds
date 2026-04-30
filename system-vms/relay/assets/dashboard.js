@@ -680,7 +680,7 @@ function renderWireGuardStatus() {
     document.getElementById('wg-interface').textContent = data.interface || 'wg-relay-server';
     document.getElementById('wg-peers').textContent = `${data.peer_count || 0} (${cgnatCount} nodes, ${systemVmCount} VMs)`;
     document.getElementById('wg-capacity').textContent = data.max_capacity || CONFIG.relayCapacity;
-    document.getElementById('wg-available').textContent = data.available_slots ??
+    document.getElementById('wg-available').textContent = data.available_slots ?? data.available_slots ?? 0;
 }
 
 /**
