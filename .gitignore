@@ -1,25 +1,18 @@
 # ── Go build outputs ────────────────────────────────────────────────
 # Compiled binaries (raw and encoded)
-system-vms/dht/dht-node-src/dht-node-amd64
-system-vms/dht/dht-node-src/dht-node-arm64
-system-vms/blockstore/blockstore-node-src/blockstore-node-amd64
-system-vms/blockstore/blockstore-node-src/blockstore-node-arm64
+**/**/src/*-amd64
+**/**/src/*-arm64
+system-vms/blockstore/src/blockstore-node-amd64
+system-vms/blockstore/src/blockstore-node-arm64
 
 # Encoded build artifacts (old gz+b64 format — not used in new pipeline)
 **/*.gz.b64
 **/*.b64
 
-# Source hash cache files (build.sh idempotency markers)
-**/.dht-node-source.sha256
-**/.blockstore-node-source.sha256
-
 # Go toolchain caches (auto-downloaded by build.sh self-bootstrapping)
-**/dht-node-src/.go-*
-**/dht-node-src/.gopath/
-**/dht-node-src/.gocache/
-**/blockstore-node-src/.go-*
-**/blockstore-node-src/.gopath/
-**/blockstore-node-src/.gocache/
+**/src/.go-*
+**/src/.gopath/
+**/src/.gocache/
 
 # Go module download cache
 **/vendor/
@@ -55,4 +48,4 @@ desktop.ini
 *.env
 .env.*
 !.env.example
-artifact-constants.*
+**/artifact-constants.*
