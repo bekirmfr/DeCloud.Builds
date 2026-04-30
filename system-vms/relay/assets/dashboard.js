@@ -89,6 +89,24 @@ async function initializeDashboard() {
             }
         } catch (_) { /* non-fatal — proceed with placeholder values */ }
 
+        // Patch any __PLACEHOLDER__ text still in the DOM from the HTML template.
+        // Artifacts are never processed by cloud-init substitution, so these
+        // values must be replaced in the DOM after the API bootstrap above.
+        const _patches = {
+            '__VM_ID__': CONFIG.relayId,
+            '__VM_NAME__': CONFIG.relayName ?? CONFIG.relayId,
+            '__RELAY_REGION__': CONFIG.relayRegion,
+            '__RELAY_CAPACITY__': String(CONFIG.relayCapacity),
+        };
+        document.querySelectorAll('*').forEach(el => {
+            if (el.children.length > 0) return;
+            let t = el.textContent;
+            if (!t.includes('__')) return;
+            for (const [ph, val] of Object.entries(_patches))
+                t = t.replaceAll(ph, val);
+            el.textContent = t;
+        });
+
         // Initial data fetch
         await updateDashboard();
 
