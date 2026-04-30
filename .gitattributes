@@ -1,31 +1,26 @@
-# Default — auto-detect
-* text=auto
+# DeCloud.Builds — line ending policy
+# All text files normalized to LF in the repository.
+# Windows contributors get LF on checkout (no conversion).
 
-# Shell scripts — must be LF on Linux VMs, never CRLF
+* text=auto eol=lf
+
+# Shell scripts must always be LF — hard requirement for shebang resolution
 *.sh text eol=lf
 
-# Python scripts — LF
-*.py text eol=lf
-
-# Go source — LF
-*.go text eol=lf
-go.mod text eol=lf
-go.sum text eol=lf
-
-# YAML — LF
+# Cloud-init files
 *.yaml text eol=lf
-*.yml text eol=lf
+*.yml  text eol=lf
 
-# Web assets — LF
-*.html text eol=lf
-*.css text eol=lf
-*.js text eol=lf
+# Python artifacts
+*.py   text eol=lf
 
-# Markdown and docs
-*.md text eol=lf
+# JSON/config
+*.json text eol=lf
+*.conf text eol=lf
+*.env  text eol=lf
 
-# Binary files — no line ending conversion
-*.gz binary
-*.b64 binary
-*.png binary
-*.jpg binary
+# Binaries — never touch
+*.qcow2 binary
+*.iso   binary
+*.gz    binary
+*.zip   binary

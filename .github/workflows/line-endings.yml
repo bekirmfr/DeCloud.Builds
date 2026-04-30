@@ -1,0 +1,41 @@
+name: Line Endings
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check-line-endings:
+    name: No CRLF in deployable files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for CRLF line endings
+        run: |
+          echo "Scanning for CRLF line endings..."
+
+          CRLF_FILES=$(grep -rlI $'\r' \
+            --include="*.sh" \
+            --include="*.yaml" \
+            --include="*.yml" \
+            --include="*.py" \
+            --include="*.json" \
+            --include="*.conf" \
+            --include="*.env" \
+            . 2>/dev/null || true)
+
+          if [ -n "$CRLF_FILES" ]; then
+            echo ""
+            echo "❌ CRLF line endings detected in the following files:"
+            echo "$CRLF_FILES" | while read -r f; do
+              echo "   $f"
+            done
+            echo ""
+            echo "Fix with:  sed -i 's/\r//' <file>"
+            echo "Permanent: ensure your editor or git config uses LF."
+            exit 1
+          fi
+
+          echo "✓ All files have LF line endings"
