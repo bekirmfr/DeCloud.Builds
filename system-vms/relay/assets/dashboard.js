@@ -669,10 +669,18 @@ function renderWireGuardStatus() {
     const cgnatCount = data.cgnat_node_count ?? 0;
     const systemVmCount = data.system_vm_count ?? 0;
 
+    // Update status badge from API response
+    const badge = document.getElementById('wg-status');
+    if (badge) {
+        const isUp = data.wireguard_up === true;
+        badge.textContent = isUp ? 'UP' : 'DOWN';
+        badge.style.background = isUp ? 'var(--success, #10b981)' : 'var(--danger, #ef4444)';
+    }
+
     document.getElementById('wg-interface').textContent = data.interface || 'wg-relay-server';
     document.getElementById('wg-peers').textContent = `${data.peer_count || 0} (${cgnatCount} nodes, ${systemVmCount} VMs)`;
     document.getElementById('wg-capacity').textContent = data.max_capacity || CONFIG.relayCapacity;
-    document.getElementById('wg-available').textContent = data.available_slots ?? 0;
+    document.getElementById('wg-available').textContent = data.available_slots ??
 }
 
 /**
