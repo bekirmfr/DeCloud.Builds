@@ -129,18 +129,15 @@ log "Notifying node agent at $NODE_AGENT_URL/api/relay/nat-ready..."
 RESPONSE=$(curl -X POST "$NODE_AGENT_URL/api/relay/nat-ready" \
     -H "Content-Type: application/json" \
     -H "X-Relay-Token: $TOKEN" \
-    -d "{
-        \"vmId\": \"$VM_ID\",
-        \"vmIp\": \"$VM_IP\"
-    }" \
+    -d "{ \"vmId\": \"$VM_ID\", \"vmIp\": \"$VM_IP\" }" \
     --max-time 10 \
     --retry 2 \
     --retry-delay 5 \
     -w "\nHTTP_CODE:%{http_code}" \
     -s \
-    2>&1)
+    2>&1 || echo "HTTP_CODE:000")
 
-HTTP_CODE=$(echo "$RESPONSE" | grep -oP 'HTTP_CODE:\K\d+')
+HTTP_CODE=$(echo "$RESPONSE" | grep -oP 'HTTP_CODE:\K\d+' || echo "000")
 
 # =====================================================
 # Handle NAT callback response
