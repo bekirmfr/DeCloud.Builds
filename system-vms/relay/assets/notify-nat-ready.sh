@@ -170,18 +170,6 @@ if [ "$HTTP_CODE" = "200" ]; then
     log "NAT configuration complete - notifying orchestrator..."
     log "=========================================="
     
-    # Start the persistent registration polling service.
-    # decloud-relay-register.service retries until the orchestrator responds with 200
-    # and exits cleanly on success — resilient to orchestrator downtime during install.
-    log "Starting orchestrator registration service (decloud-relay-register)..."
-    if systemctl start decloud-relay-register 2>/dev/null; then
-        log "✓ Registration service started — will poll until orchestrator confirms"
-        logger -t decloud-relay "Relay registration service started"
-    else
-        log "⚠ Could not start registration service — will be started by systemd at boot"
-        logger -t decloud-relay "Registration service start deferred"
-    fi
-    
     exit 0
     
 elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
