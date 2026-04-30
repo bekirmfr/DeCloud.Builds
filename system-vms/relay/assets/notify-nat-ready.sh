@@ -162,14 +162,6 @@ if [ "$HTTP_CODE" = "200" ]; then
     # Log to system journal
     logger -t decloud-relay "NAT rule configured successfully for $VM_IP via gateway $GATEWAY_IP"
     
-    # =====================================================
-    # STEP 2: Now notify orchestrator that relay is fully ready
-    # =====================================================
-    log ""
-    log "=========================================="
-    log "NAT configuration complete - notifying orchestrator..."
-    log "=========================================="
-    
     exit 0
     
 elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
