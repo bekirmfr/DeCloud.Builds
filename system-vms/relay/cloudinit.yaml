@@ -293,6 +293,8 @@ write_files:
       
       [Service]
       Type=oneshot
+      Environment="RELAY_VM_ID=__VM_ID__"
+      Environment="HOST_MACHINE_ID=__HOST_MACHINE_ID__"
       ExecStartPre=/bin/bash -c 'if [ -f /var/lib/decloud/nat-callback-complete ]; then echo "NAT callback already completed"; exit 0; fi'
       ExecStart=/usr/local/bin/notify-nat-ready.sh
       ExecStartPost=/bin/bash -c 'mkdir -p /var/lib/decloud && touch /var/lib/decloud/nat-callback-complete'

@@ -59,7 +59,11 @@ if [ -z "$GATEWAY_IP" ]; then
 fi
 
 NODE_AGENT_URL="http://${GATEWAY_IP}:5100"
-VM_ID="__VM_ID__"
+# VM_ID and HOST_MACHINE_ID are injected by the systemd unit via Environment=
+# (cloud-init substitutes __VM_ID__ and __HOST_MACHINE_ID__ in the service file
+# at write_files time — the artifact itself is never processed by cloud-init).
+VM_ID="${RELAY_VM_ID:?RELAY_VM_ID environment variable not set}"
+MACHINE_ID="${HOST_MACHINE_ID:?HOST_MACHINE_ID environment variable not set}"
 
 log "Detected gateway IP: $GATEWAY_IP"
 log "Node agent URL: $NODE_AGENT_URL"
@@ -112,7 +116,6 @@ done
 # =====================================================
 # Compute authentication token
 # =====================================================
-MACHINE_ID="__HOST_MACHINE_ID__"
 log "Using machine ID for authentication: ${MACHINE_ID:0:8}..."
 
 MESSAGE="${VM_ID}:${VM_IP}"
