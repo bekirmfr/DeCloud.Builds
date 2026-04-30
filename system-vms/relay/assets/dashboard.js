@@ -77,6 +77,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function initializeDashboard() {
     try {
+        // Bootstrap config from relay status API — dashboard.js is delivered
+        // via artifact pipeline and never receives __PLACEHOLDER__ substitution.
+        try {
+            const status = await fetchAPI(CONFIG.api.status);
+            if (status) {
+                CONFIG.relayId = status.relay_id ?? CONFIG.relayId;
+                CONFIG.relayName = status.relay_name ?? CONFIG.relayName;
+                CONFIG.relayRegion = status.region ?? CONFIG.relayRegion;
+                CONFIG.relayCapacity = status.max_capacity ?? CONFIG.relayCapacity;
+            }
+        } catch (_) { /* non-fatal — proceed with placeholder values */ }
+
         // Initial data fetch
         await updateDashboard();
 
