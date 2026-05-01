@@ -18,9 +18,26 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 # ==================== Configuration ====================
-DHT_API_PORT = int(os.environ.get("DHT_API_PORT", "__DHT_API_PORT__"))
+DHT_API_PORT = int(os.environ.get("DHT_API_PORT", "5080"))
 STATIC_DIR = "/opt/decloud-dht/static"
 LISTEN_PORT = 8080
+
+# Load metadata written by cloud-init write_files (substituted by LibvirtVmManager).
+# Used to inject __VM_ID__, __DHT_REGION__, __NODE_ID__ into served static files.
+def _load_dht_metadata():
+    try:
+        with open('/etc/decloud/dht-metadata.json', 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+_meta = _load_dht_metadata()
+_SUBSTITUTIONS = {
+    '__VM_ID__':      _meta.get('vm_id', 'unknown'),
+    '__VM_NAME__':    _meta.get('vm_name', 'unknown'),
+    '__DHT_REGION__': _meta.get('region', 'unknown'),
+    '__NODE_ID__':    _meta.get('node_id', 'unknown'),
+}
 
 # API endpoints to proxy to the Go binary (read-only only).
 # Mutating endpoints (/connect, /publish) are not exposed — they require
@@ -70,7 +87,23 @@ class DhtDashboardHandler(BaseHTTPRequestHandler):
         if not os.path.exists(fpath):
             self._send_error(404, "Dashboard not found")
             return
-        self._send_file(fpath, "text/html; charset=utf-8")
+        self._send_file_with_substitution(fpath, "text/html; charset=utf-8")
+
+    def _send_file_with_substitution(self, fpath, content_type):
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            for placeholder, value in _SUBSTITUTIONS.items():
+                content = content.replace(placeholder, value)
+            data = content.encode('utf-8')
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", len(data))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            logger.error("Failed to serve file %s: %s", fpath, e)
+            self._send_error(500, "Internal server error")
 
     def _serve_static(self, url_path):
         rel = url_path.replace("/static/", "", 1)
@@ -91,7 +124,12 @@ class DhtDashboardHandler(BaseHTTPRequestHandler):
         elif fpath.endswith(".html"):
             ct = "text/html; charset=utf-8"
 
-        self._send_file(fpath, ct)
+        # Apply __PLACEHOLDER__ substitution to JS and HTML so CONFIG values
+        # (vm_id, region, node_id) are injected at serve time from dht-metadata.json.
+        if fpath.endswith(".js") or fpath.endswith(".html"):
+            self._send_file_with_substitution(fpath, ct)
+        else:
+            self._send_file(fpath, ct)
 
     def _send_file(self, fpath, content_type):
         with open(fpath, "rb") as f:
