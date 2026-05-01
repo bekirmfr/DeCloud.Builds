@@ -50,8 +50,8 @@ write_files:
   - path: /etc/decloud-dht/dht.env
     permissions: '0644'
     content: |
-      DHT_LISTEN_PORT=__DHT_LISTEN_PORT__
-      DHT_API_PORT=__DHT_API_PORT__
+      DHT_LISTEN_PORT=4001
+      DHT_API_PORT=5080
       DHT_ADVERTISE_IP=__DHT_ADVERTISE_IP__
       DHT_BOOTSTRAP_PEERS=__DHT_BOOTSTRAP_PEERS__
       DHT_DATA_DIR=/var/lib/decloud-dht
