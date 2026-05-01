@@ -35,7 +35,7 @@ log "Starting DHT ready callback..."
 
 source /etc/decloud-dht/dht.env 2>/dev/null || true
 API_PORT="${DHT_API_PORT:-5080}"
-VM_ID="__VM_ID__"
+VM_ID="${DECLOUD_VM_ID:-}"
 
 # =====================================================
 # Detect gateway IP (node agent host)
@@ -99,7 +99,7 @@ done
 # =====================================================
 # Compute authentication token
 # =====================================================
-MACHINE_ID="__HOST_MACHINE_ID__"
+MACHINE_ID="${HOST_MACHINE_ID:-}"
 MESSAGE="${VM_ID}:${PEER_ID}"
 TOKEN=$(echo -n "$MESSAGE" | openssl dgst -sha256 -hmac "$MACHINE_ID" -binary | base64)
 

@@ -27,13 +27,12 @@ log() {
 # =====================================================
 # Configuration (injected by cloud-init)
 # =====================================================
-ORCHESTRATOR_URL="__ORCHESTRATOR_URL__"
-NODE_ID="__NODE_ID__"
-VM_ID="__VM_ID__"
-# Source env file — DHT_API_PORT and DHT_ADVERTISE_IP are written by
-# cloud-init (port hardcoded) and wg-config-fetch.sh (advertise IP updated).
 source /etc/decloud-dht/dht.env 2>/dev/null || true
+ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-}"
+NODE_ID="${DECLOUD_NODE_ID:-}"
+VM_ID="${DECLOUD_VM_ID:-}"
 API_PORT="${DHT_API_PORT:-5080}"
+ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
 ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
 
 # Auth token from NodeAgent obligation state — persistent across redeployments.
