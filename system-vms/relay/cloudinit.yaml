@@ -309,6 +309,16 @@ write_files:
       NODE_ID="__NODE_ID__"
       RELAY_VM_ID="__VM_ID__"
       PUBLIC_IP="__PUBLIC_IP__"
+      # Runtime fallback — if cloud-init substitution produced empty IP (ipify.org
+      # unreachable at node agent startup), discover it inside the VM instead.
+      if [ -z "$PUBLIC_IP" ]; then
+          PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null \
+                   || curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
+                   || ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' \
+                   || echo "")
+          [ -n "$PUBLIC_IP" ] && log "Runtime IP discovery: $PUBLIC_IP" \
+                               || log "WARNING: Could not discover public IP — endpoint will be empty"
+      fi
 
       # Read from files written by runcmd obligation state fetch —
       # guaranteed to reflect the actual running keypair and subnet.
