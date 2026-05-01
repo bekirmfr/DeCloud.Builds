@@ -16,9 +16,9 @@ const CONFIG = {
     refreshInterval: 10000,  // 10 seconds
 
     api: {
-        health:      '/health',
-        peers:       '/peers',
-        diagnostics: '/diagnostics'
+        health:      'health',
+        peers:       'peers',
+        diagnostics: 'diagnostics'
     }
 };
 
