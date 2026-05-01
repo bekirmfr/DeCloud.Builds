@@ -33,7 +33,8 @@ fi
 
 log "Starting DHT ready callback..."
 
-API_PORT="__DHT_API_PORT__"
+source /etc/decloud-dht/dht.env 2>/dev/null || true
+API_PORT="${DHT_API_PORT:-5080}"
 VM_ID="__VM_ID__"
 
 # =====================================================

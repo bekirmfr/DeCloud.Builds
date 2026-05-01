@@ -30,7 +30,11 @@ log() {
 ORCHESTRATOR_URL="__ORCHESTRATOR_URL__"
 NODE_ID="__NODE_ID__"
 VM_ID="__VM_ID__"
-API_PORT="__DHT_API_PORT__"
+# Source env file — DHT_API_PORT and DHT_ADVERTISE_IP are written by
+# cloud-init (port hardcoded) and wg-config-fetch.sh (advertise IP updated).
+source /etc/decloud-dht/dht.env 2>/dev/null || true
+API_PORT="${DHT_API_PORT:-5080}"
+ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
 
 # Auth token from NodeAgent obligation state — persistent across redeployments.
 # Queried live so the token is always current even after NodeAgent key rotation.
@@ -146,11 +150,12 @@ while true; do
     RESPONSE=$(curl -X POST "${ORCHESTRATOR_URL}/api/dht/join" \
         -H "Content-Type: application/json" \
         -H "X-DHT-Token: $TOKEN" \
-        -d "{
+       -d "{
             \"nodeId\": \"$NODE_ID\",
             \"vmId\": \"$VM_ID\",
-            \"peerId\": \"$PEER_ID\"
-        }" \
+            \"peerId\": \"$PEER_ID\",
+            \"advertiseIp\": \"$ADVERTISE_IP\"
+        }"
         --max-time 10 \
         -s \
         -w "\nHTTP_CODE:%{http_code}" \
