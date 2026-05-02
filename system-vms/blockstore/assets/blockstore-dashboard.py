@@ -36,12 +36,18 @@ def _load_blockstore_metadata():
         return {}
 
 _meta = _load_blockstore_metadata()
+
+# advertise_ip is a runtime value — assigned by wg-config-fetch.sh at boot
+# and written to /etc/decloud-blockstore/blockstore.env, which systemd loads
+# into this service's environment via EnvironmentFile=. The metadata JSON
+# carries only immutable identity; runtime values come from their actual
+# authority (the env file).
 _SUBSTITUTIONS = {
     '__VM_ID__':                  _meta.get('vm_id', 'unknown'),
     '__VM_NAME__':                _meta.get('vm_name', 'unknown'),
     '__NODE_ID__':                _meta.get('node_id', 'unknown'),
     '__NODE_REGION__':            _meta.get('region', 'unknown'),
-    '__BLOCKSTORE_ADVERTISE_IP__': _meta.get('advertise_ip', ''),
+    '__BLOCKSTORE_ADVERTISE_IP__': os.environ.get('BLOCKSTORE_ADVERTISE_IP', ''),
 }
 
 # ==================== Logging ====================
