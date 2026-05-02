@@ -1,20 +1,17 @@
 #!/bin/bash
 #
 # DeCloud Block Store Bootstrap Peer Polling
-# Version: 1.0
+# Version: 2.0
 #
-# Polls the orchestrator for bootstrap peers while the block store
-# node has no connected peers. Once connected, backs off to maintenance
-# polling.
+# Two responsibilities, two authorities:
+#   • Local sibling (co-located DHT)   ← NodeAgent /api/system-vms/dht/peer-info
+#   • Remote blockstores (federation)  ← Orchestrator /api/blockstore/join
+#
+# Both flow through the binary's idempotent /connect endpoint, so repeating
+# the calls every poll iteration is safe and self-healing.
 #
 # Authentication: HMAC-SHA256(authToken, nodeId:vmId)
 # Endpoint:       POST /api/blockstore/join  (Orchestrator)
-#
-# Flow:
-#   1. Wait for block store binary to start and report its peer ID
-#   2. Call /api/blockstore/join — register peerId, receive bootstrap peers
-#   3. Connect binary to returned peers via POST /connect on local API
-#   4. Loop: re-poll if peers drop to zero
 
 set -euo pipefail
 
@@ -50,7 +47,7 @@ if [ -z "$AUTH_TOKEN" ]; then
     exit 1
 fi
 
-POLL_INTERVAL_ISOLATED=30    # seconds between polls when no peers
+POLL_INTERVAL_ISOLATED=30   # seconds between polls when no remote peers
 POLL_INTERVAL_CONNECTED=60  # seconds between polls when connected
 
 # ═══════════════════════════════════════════════════════════════════
@@ -60,12 +57,10 @@ log "Waiting for block store binary to start..."
 PEER_ID=""
 
 for i in $(seq 1 60); do
-    # Try peer-id file first (written by binary at startup)
     if [ -f "/var/lib/decloud-blockstore/peer-id" ]; then
         PEER_ID=$(cat /var/lib/decloud-blockstore/peer-id 2>/dev/null | tr -d '\n')
     fi
 
-    # Fallback: read from HTTP API
     if [ -z "$PEER_ID" ] || [ "$PEER_ID" = "null" ]; then
         HEALTH=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/health" 2>/dev/null) || true
         PEER_ID=$(echo "$HEALTH" | jq -r '.peerId // ""' 2>/dev/null) || true
@@ -89,7 +84,6 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════
 # Compute HMAC-SHA256 authentication token
-# Token: HMAC-SHA256(authToken, nodeId:vmId)
 # ═══════════════════════════════════════════════════════════════════
 compute_token() {
     local message="${NODE_ID}:${VM_ID}"
@@ -98,48 +92,76 @@ compute_token() {
 
 TOKEN=$(compute_token)
 
-# Read advertise IP from blockstore env once — written by cloud-init runcmd
-# after WireGuard tunnel IP override, so this reflects the WG mesh IP.
-# Re-source env every iteration — wg-config-fetch may update BLOCKSTORE_ADVERTISE_IP
-# after initial startup. Guard: only register with a WireGuard mesh IP (10.20.x.x).
+# ═══════════════════════════════════════════════════════════════════
+# Local sibling discovery — connect to co-located DHT via NodeAgent.
+#
+# The NodeAgent is the authoritative source for "what's running on this
+# host"; the orchestrator only knows about cross-node federation. 404 from
+# the NodeAgent means the sibling is still booting — silent retry next
+# iteration. The binary's /connect endpoint is idempotent, so calling it
+# every iteration costs nothing and self-heals after sibling redeploys.
+# ═══════════════════════════════════════════════════════════════════
+LOCAL_DHT_CONNECTED=false
+
+connect_local_dht() {
+    local response peer_id ip port multiaddr
+    response=$(curl -sf --max-time 3 \
+        "${NODE_AGENT}/api/system-vms/dht/peer-info" 2>/dev/null) || return 0
+
+    peer_id=$(echo "$response" | jq -r '.peerId // empty' 2>/dev/null)
+    ip=$(echo      "$response" | jq -r '.ipAddress // empty' 2>/dev/null)
+    port=$(echo    "$response" | jq -r '.port // empty' 2>/dev/null)
+
+    if [ -z "$peer_id" ] || [ -z "$ip" ] || [ -z "$port" ]; then
+        return 0
+    fi
+
+    multiaddr="/ip4/${ip}/tcp/${port}/p2p/${peer_id}"
+
+    # Idempotent — /connect is a no-op if already connected.
+    curl -s -X POST "http://127.0.0.1:${API_PORT}/connect" \
+        -H "Content-Type: application/json" \
+        -d "{\"peers\":[\"${multiaddr}\"]}" \
+        --max-time 5 >/dev/null 2>&1 || return 0
+
+    if [ "$LOCAL_DHT_CONNECTED" != "true" ]; then
+        log "Connected to local DHT sibling at ${ip}:${port}"
+        LOCAL_DHT_CONNECTED=true
+    fi
+}
 
 # ═══════════════════════════════════════════════════════════════════
 # Main polling loop
 # ═══════════════════════════════════════════════════════════════════
 log "Entering bootstrap poll loop..."
 CONSECUTIVE_FAILURES=0
-# Always poll orchestrator at least once on startup, regardless of peer count.
-# This ensures blockstore-to-blockstore connections are established via the
-# join response even when already connected to the local DHT VM.
-# Without this, bitswap must rely on slow DHT FindProviders for every block fetch.
 INITIAL_POLL_DONE=false
-REMOTE_BS_CONNECTED=false
 
 while true; do
-    # Check current peer count
+    # ── 1. Always (re)connect local sibling — idempotent, ~ms latency ──
+    connect_local_dht
+
+    # ── 2. Check current peer count from binary ────────────────────────
     HEALTH=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/health" 2>/dev/null) || true
     CONNECTED=$(echo "$HEALTH" | jq -r '.connectedPeers // 0' 2>/dev/null) || CONNECTED=0
 
-    # Derive remote blockstore connectivity from live peer count every iteration.
-    # connectedPeers > 1 means at least one peer beyond the local DHT VM.
+    # ── 3. If we have remote blockstore peers (more than just local DHT)
+    #       and DHT routing is healthy, back off to maintenance polling.
+    REMOTE_BS_CONNECTED=false
     if [ "$CONNECTED" -gt 1 ]; then
         REMOTE_BS_CONNECTED=true
-    else
-        REMOTE_BS_CONNECTED=false   # ← the fix: reset when remote peers drop
     fi
 
-    if [ "$CONNECTED" -gt 0 ] && [ "$INITIAL_POLL_DONE" = "true" ] && [ "$REMOTE_BS_CONNECTED" = "true" ]; then
-        # Check DHT health — not just peer count.
-        # After NodeAgent restart the blockstore may connect to remote peers
-        # via WireGuard while the local DHT VM is still booting, leaving the
-        # routing table empty and all dht.Provide() calls failing.
+    if [ "$INITIAL_POLL_DONE" = "true" ] && [ "$REMOTE_BS_CONNECTED" = "true" ]; then
+        # Verify DHT announces are actually working — connectedPeers alone
+        # can be misleading if local DHT is up but remote DHTs are unreachable.
         DIAG=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/diagnostics" 2>/dev/null) || DIAG="{}"
         DHT_OK=$(echo "$DIAG"   | jq -r '.dhtAnnounce.success // 0' 2>/dev/null) || DHT_OK=0
         DHT_FAIL=$(echo "$DIAG" | jq -r '.dhtAnnounce.fail    // 0' 2>/dev/null) || DHT_FAIL=0
 
         if [ "$DHT_FAIL" -gt 0 ] && [ "$DHT_OK" -eq 0 ]; then
-            log "DHT routing table empty (fail=$DHT_FAIL, ok=$DHT_OK) — re-polling orchestrator to reconnect local DHT"
-            # Fall through to re-poll rather than sleeping
+            log "DHT routing table empty (fail=$DHT_FAIL, ok=$DHT_OK) — re-polling orchestrator"
+            # Fall through to re-poll
         else
             if [ "$CONSECUTIVE_FAILURES" -gt 0 ]; then
                 log "Connected to $CONNECTED peer(s) — resuming maintenance polling"
@@ -151,31 +173,26 @@ while true; do
     fi
 
     if [ "$CONNECTED" -gt 0 ]; then
-        log "Connected to $CONNECTED peer(s) — performing initial orchestrator poll to discover other blockstores..."
+        log "Connected to $CONNECTED peer(s) — polling orchestrator for remote blockstores..."
     else
         log "No connected peers — polling orchestrator for bootstrap peers..."
     fi
-INITIAL_POLL_DONE=true
+    INITIAL_POLL_DONE=true
 
-    # Guard: only register when BLOCKSTORE_ADVERTISE_IP is a WireGuard mesh IP.
+    # ── 4. Refresh advertise IP — wg-config-fetch may have updated it. ─
     source /etc/decloud-blockstore/blockstore.env 2>/dev/null || true
     ADVERTISE_IP="${BLOCKSTORE_ADVERTISE_IP:-}"
     if ! echo "${ADVERTISE_IP}" | grep -qE '^10\.20\.'; then
-        log "WARN: BLOCKSTORE_ADVERTISE_IP='${ADVERTISE_IP}' is not a WireGuard mesh IP — skipping join until wg-mesh assigns tunnel IP"
+        log "WARN: BLOCKSTORE_ADVERTISE_IP='${ADVERTISE_IP}' is not a WireGuard mesh IP — skipping join"
         sleep "$POLL_INTERVAL_ISOLATED"
         continue
     fi
 
-    # Call orchestrator /api/blockstore/join
+    # ── 5. Call orchestrator /api/blockstore/join ─────────────────────
     RESPONSE=$(curl -X POST "${ORCHESTRATOR_URL}/api/blockstore/join" \
         -H "Content-Type: application/json" \
         -H "X-BlockStore-Token: $TOKEN" \
-        -d "{
-            \"nodeId\":     \"$NODE_ID\",
-            \"vmId\":       \"$VM_ID\",
-            \"peerId\":     \"$PEER_ID\",
-            \"advertiseIp\": \"$ADVERTISE_IP\"
-        }" \
+        -d "{\"nodeId\":\"$NODE_ID\",\"vmId\":\"$VM_ID\",\"peerId\":\"$PEER_ID\",\"advertiseIp\":\"$ADVERTISE_IP\"}" \
         --max-time 10 \
         -s \
         -w "\nHTTP_CODE:%{http_code}" \
@@ -186,14 +203,11 @@ INITIAL_POLL_DONE=true
 
     if [ "$HTTP_CODE" = "200" ]; then
         CONSECUTIVE_FAILURES=0
-        BOOTSTRAP_PEERS=$(echo "$BODY" | jq -r '.bootstrapPeers[]?' 2>/dev/null | tr '\n' ',')
-        BOOTSTRAP_PEERS="${BOOTSTRAP_PEERS%,}"  # trim trailing comma
         PEER_COUNT=$(echo "$BODY" | jq '.bootstrapPeers | length' 2>/dev/null || echo 0)
 
-        log "Orchestrator returned $PEER_COUNT bootstrap peer(s)"
+        log "Orchestrator returned $PEER_COUNT remote bootstrap peer(s)"
 
-        if [ -n "$BOOTSTRAP_PEERS" ] && [ "$PEER_COUNT" -gt 0 ]; then
-            # Feed bootstrap peers to the running binary via its /connect API
+        if [ "$PEER_COUNT" -gt 0 ]; then
             PEERS_JSON=$(echo "$BODY" | jq '.bootstrapPeers')
             CONNECT_RESP=$(curl -s -X POST "http://127.0.0.1:${API_PORT}/connect" \
                 -H "Content-Type: application/json" \
@@ -201,26 +215,9 @@ INITIAL_POLL_DONE=true
                 --max-time 15 2>/dev/null) || true
 
             CONNECTED_COUNT=$(echo "$CONNECT_RESP" | jq -r '.connected // 0' 2>/dev/null) || CONNECTED_COUNT=0
-            log "Connected to $CONNECTED_COUNT/$PEER_COUNT bootstrap peer(s)"
-
-            # Wait briefly for libp2p dials to complete — the /connect response
-            # is fast but the actual TCP handshake continues in the background.
-            # Re-check connectedPeers after 8s to confirm the remote blockstore
-            # actually connected (not just the local DHT).
-            if [ "$PEER_COUNT" -gt 0 ]; then
-                sleep 8
-                ACTUAL_PEERS=$(curl -s --max-time 3 "http://127.0.0.1:${API_PORT}/health" 2>/dev/null \
-                    | jq -r '.connectedPeers // 0' 2>/dev/null) || ACTUAL_PEERS=0
-                # connectedPeers > 1 means at least one remote peer beyond local DHT
-                if [ "$ACTUAL_PEERS" -gt 1 ]; then
-                    REMOTE_BS_CONNECTED=true
-                    log "Remote blockstore connected (total peers: $ACTUAL_PEERS)"
-                else
-                    log "Remote blockstore not yet connected (peers: $ACTUAL_PEERS) — will retry"
-                fi
-            fi
+            log "Connected to $CONNECTED_COUNT/$PEER_COUNT remote bootstrap peer(s)"
         else
-            log "No bootstrap peers available yet — will retry in ${POLL_INTERVAL_ISOLATED}s"
+            log "No remote blockstores yet — will retry in ${POLL_INTERVAL_ISOLATED}s"
         fi
     elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
         log "ERROR: Authentication failed (HTTP $HTTP_CODE) — check blockstore auth token"
