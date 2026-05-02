@@ -19,7 +19,7 @@ PEER_ID=$(echo "$HEALTH" | jq -r '.peerId // ""' 2>/dev/null)
 PEERS=$(echo "$HEALTH" | jq -r '.connectedPeers // 0' 2>/dev/null)
 USAGE=$(echo "$HEALTH" | jq -r '.usagePercent // 0' 2>/dev/null)
 
-if [ "$STATUS" != "ok" ]; then
+if [ "$STATUS" != "active" ]; then
     echo "Block store status: $STATUS"
     exit 1
 fi

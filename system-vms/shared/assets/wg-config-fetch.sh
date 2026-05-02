@@ -69,6 +69,7 @@ WG_INTERFACE=wg-mesh
 WG_PEER_TYPE=system-vm
 WG_PARENT_NODE_ID=${NODE_ID}
 WG_DESCRIPTION=${ROLE}-${VM_ID}
+WG_ROLE=${ROLE}
 EOF
             chmod 600 /etc/decloud/wg-mesh.env
             log "Wrote /etc/decloud/wg-mesh.env"

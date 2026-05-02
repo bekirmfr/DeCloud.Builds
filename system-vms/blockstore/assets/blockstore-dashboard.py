@@ -17,7 +17,7 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError
 
 # ==================== Configuration ====================
-BLOCKSTORE_API_PORT = int(os.environ.get("BLOCKSTORE_API_PORT", "__BLOCKSTORE_API_PORT__"))
+BLOCKSTORE_API_PORT = int(os.environ.get("BLOCKSTORE_API_PORT", "5090"))
 STATIC_DIR = "/opt/decloud-blockstore/static"
 LISTEN_PORT = 8080
 

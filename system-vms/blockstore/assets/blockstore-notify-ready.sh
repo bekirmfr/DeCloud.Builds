@@ -33,8 +33,9 @@ fi
 
 log "Starting block store ready callback..."
 
-API_PORT="__BLOCKSTORE_API_PORT__"
-VM_ID="__VM_ID__"
+source /etc/decloud-blockstore/blockstore.env 2>/dev/null || true
+API_PORT="${BLOCKSTORE_API_PORT:-5090}"
+VM_ID="${BLOCKSTORE_VM_ID:-}"
 
 # ═══════════════════════════════════════════════════════════════════
 # Detect NodeAgent host (default gateway via virbr0)
@@ -97,7 +98,7 @@ done
 # Compute HMAC-SHA256 authentication token
 # Token: HMAC-SHA256(machineId, vmId:peerId)
 # ═══════════════════════════════════════════════════════════════════
-MACHINE_ID="__HOST_MACHINE_ID__"
+MACHINE_ID="${HOST_MACHINE_ID:-}"
 MESSAGE="${VM_ID}:${PEER_ID}"
 TOKEN=$(echo -n "$MESSAGE" | openssl dgst -sha256 -hmac "$MACHINE_ID" -binary | base64)
 

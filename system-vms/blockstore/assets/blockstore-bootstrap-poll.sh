@@ -27,10 +27,11 @@ log() {
 # ═══════════════════════════════════════════════════════════════════
 # Configuration (baked in by cloud-init)
 # ═══════════════════════════════════════════════════════════════════
-ORCHESTRATOR_URL="__ORCHESTRATOR_URL__"
-NODE_ID="__BLOCKSTORE_NODE_ID__"
-VM_ID="__VM_ID__"
-API_PORT="__BLOCKSTORE_API_PORT__"
+source /etc/decloud-blockstore/blockstore.env 2>/dev/null || true
+ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-}"
+NODE_ID="${BLOCKSTORE_NODE_ID:-}"
+VM_ID="${BLOCKSTORE_VM_ID:-}"
+API_PORT="${BLOCKSTORE_API_PORT:-5090}"
 
 GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
 NODE_AGENT="http://${GATEWAY}:5100"
@@ -99,9 +100,8 @@ TOKEN=$(compute_token)
 
 # Read advertise IP from blockstore env once — written by cloud-init runcmd
 # after WireGuard tunnel IP override, so this reflects the WG mesh IP.
-ADVERTISE_IP=$(grep -oP 'BLOCKSTORE_ADVERTISE_IP=\K\S+' \
-    /etc/decloud-blockstore/blockstore.env 2>/dev/null || true)
-log "Advertise IP: ${ADVERTISE_IP:-<not set>}"
+# Re-source env every iteration — wg-config-fetch may update BLOCKSTORE_ADVERTISE_IP
+# after initial startup. Guard: only register with a WireGuard mesh IP (10.20.x.x).
 
 # ═══════════════════════════════════════════════════════════════════
 # Main polling loop
@@ -155,7 +155,16 @@ while true; do
     else
         log "No connected peers — polling orchestrator for bootstrap peers..."
     fi
-    INITIAL_POLL_DONE=true
+INITIAL_POLL_DONE=true
+
+    # Guard: only register when BLOCKSTORE_ADVERTISE_IP is a WireGuard mesh IP.
+    source /etc/decloud-blockstore/blockstore.env 2>/dev/null || true
+    ADVERTISE_IP="${BLOCKSTORE_ADVERTISE_IP:-}"
+    if ! echo "${ADVERTISE_IP}" | grep -qE '^10\.20\.'; then
+        log "WARN: BLOCKSTORE_ADVERTISE_IP='${ADVERTISE_IP}' is not a WireGuard mesh IP — skipping join until wg-mesh assigns tunnel IP"
+        sleep "$POLL_INTERVAL_ISOLATED"
+        continue
+    fi
 
     # Call orchestrator /api/blockstore/join
     RESPONSE=$(curl -X POST "${ORCHESTRATOR_URL}/api/blockstore/join" \
@@ -213,6 +222,10 @@ while true; do
         else
             log "No bootstrap peers available yet — will retry in ${POLL_INTERVAL_ISOLATED}s"
         fi
+    elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+        log "ERROR: Authentication failed (HTTP $HTTP_CODE) — check blockstore auth token"
+        sleep 60
+        continue
     else
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         log "Orchestrator join failed (HTTP ${HTTP_CODE:-timeout}), failures: $CONSECUTIVE_FAILURES"
