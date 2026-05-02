@@ -17,10 +17,10 @@ const CONFIG = {
     refreshInterval: 15000,  // 15 seconds
 
     api: {
-        health:      '/health',
-        stats:       '/stats',
-        manifests:   '/manifests',
-        diagnostics: '/diagnostics'
+        health:      'health',
+        stats:       'stats',
+        manifests:   'manifests',
+        diagnostics: 'diagnostics'
     },
 
     gcTrigger:   85,
@@ -417,10 +417,10 @@ function renderLastUpdate() {
 
 // ==================== Export Functionality ====================
 const EXPORT_ENDPOINTS = [
-    { key: 'health',      label: 'Health',         url: '/health' },
-    { key: 'stats',       label: 'Storage Stats',  url: '/stats' },
-    { key: 'manifests',   label: 'Manifests',      url: '/manifests' },
-    { key: 'diagnostics', label: 'Diagnostics',    url: '/diagnostics' },
+    { key: 'health',      label: 'Health',         url: CONFIG.api.health },
+    { key: 'stats',       label: 'Storage Stats',  url: CONFIG.api.stats },
+    { key: 'manifests',   label: 'Manifests',      url: CONFIG.api.manifests },
+    { key: 'diagnostics', label: 'Diagnostics',    url: CONFIG.api.diagnostics },
 ];
 
 const exportEnabled = new Set(EXPORT_ENDPOINTS.map(ep => ep.key));
