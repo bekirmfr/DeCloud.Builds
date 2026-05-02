@@ -145,6 +145,20 @@ while true; do
     fi
     INITIAL_POLL_DONE=true
 
+    # Guard: advertise IP must be a WireGuard mesh IP before registering.
+    # If wg-config-fetch failed silently, DHT_ADVERTISE_IP may be empty or a
+    # public IP. Registering with a wrong IP stores a bad ListenAddress in the
+    # orchestrator and gives other nodes an unreachable multiaddr (the host's
+    # CGNAT tunnel IP instead of the DHT VM's WireGuard tunnel IP).
+    # Re-source dht.env — wg-config-fetch or the watchdog may have updated it.
+    source /etc/decloud-dht/dht.env 2>/dev/null || true
+    ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
+    if ! echo "${ADVERTISE_IP}" | grep -qE '^10\.20\.'; then
+        log "WARN: ADVERTISE_IP='${ADVERTISE_IP}' is not a WireGuard mesh IP (10.20.x.x) — skipping join until wg-mesh assigns tunnel IP"
+        sleep "$POLL_INTERVAL_ISOLATED"
+        continue
+    fi
+
     # Call orchestrator /api/dht/join
     RESPONSE=$(curl -X POST "${ORCHESTRATOR_URL}/api/dht/join" \
         -H "Content-Type: application/json" \
