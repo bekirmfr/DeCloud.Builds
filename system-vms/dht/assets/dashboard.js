@@ -283,9 +283,9 @@ function renderLastUpdate() {
 
 // ==================== Export Functionality ====================
 const EXPORT_ENDPOINTS = [
-    { key: 'health',      label: 'Health',         url: '/health' },
-    { key: 'peers',       label: 'Peers',          url: '/peers' },
-    { key: 'diagnostics', label: 'Diagnostics',    url: '/diagnostics' },
+    { key: 'health', label: 'Health', url: CONFIG.api.health },
+    { key: 'peers', label: 'Peers', url: CONFIG.api.peers },
+    { key: 'diagnostics', label: 'Diagnostics', url: CONFIG.api.diagnostics },
 ];
 
 const exportEnabled = new Set(EXPORT_ENDPOINTS.map(ep => ep.key));
