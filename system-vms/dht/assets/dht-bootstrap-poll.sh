@@ -163,12 +163,7 @@ while true; do
     RESPONSE=$(curl -X POST "${ORCHESTRATOR_URL}/api/dht/join" \
         -H "Content-Type: application/json" \
         -H "X-DHT-Token: $TOKEN" \
-       -d "{
-            \"nodeId\": \"$NODE_ID\",
-            \"vmId\": \"$VM_ID\",
-            \"peerId\": \"$PEER_ID\",
-            \"advertiseIp\": \"$ADVERTISE_IP\"
-        }"
+        -d "{\"nodeId\":\"$NODE_ID\",\"vmId\":\"$VM_ID\",\"peerId\":\"$PEER_ID\",\"advertiseIp\":\"$ADVERTISE_IP\"}" \
         --max-time 10 \
         -s \
         -w "\nHTTP_CODE:%{http_code}" \
