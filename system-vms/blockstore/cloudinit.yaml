@@ -82,6 +82,7 @@ write_files:
         "node_id": "__NODE_ID__",
         "vm_id": "__VM_ID__",
         "vm_name": "__VM_NAME__",
+        "region": "__DHT_REGION__",
         "listen_port": __BLOCKSTORE_LISTEN_PORT__,
         "api_port": __BLOCKSTORE_API_PORT__,
         "advertise_ip": "__WG_TUNNEL_IP__",

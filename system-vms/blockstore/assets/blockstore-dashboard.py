@@ -25,6 +25,25 @@ LISTEN_PORT = 8080
 # Mutating endpoints (/gc, /connect) are not exposed publicly.
 PROXY_PATHS = {"/health", "/stats", "/manifests", "/diagnostics"}
 
+# Load metadata written by cloud-init write_files (substituted by LibvirtVmManager).
+# Used to inject __VM_ID__, __VM_NAME__, __NODE_ID__, __BLOCKSTORE_ADVERTISE_IP__ into
+# served static files — mirrors the pattern in dht-dashboard.py.
+def _load_blockstore_metadata():
+    try:
+        with open('/etc/decloud/blockstore-metadata.json', 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+_meta = _load_blockstore_metadata()
+_SUBSTITUTIONS = {
+    '__VM_ID__':                  _meta.get('vm_id', 'unknown'),
+    '__VM_NAME__':                _meta.get('vm_name', 'unknown'),
+    '__NODE_ID__':                _meta.get('node_id', 'unknown'),
+    '__NODE_REGION__':            _meta.get('region', 'unknown'),
+    '__BLOCKSTORE_ADVERTISE_IP__': _meta.get('advertise_ip', ''),
+}
+
 # ==================== Logging ====================
 logging.basicConfig(
     level=logging.INFO,
@@ -63,7 +82,23 @@ class BlockStoreDashboardHandler(BaseHTTPRequestHandler):
         if not os.path.exists(fpath):
             self._send_error(404, "Dashboard not found")
             return
-        self._send_file(fpath, "text/html; charset=utf-8")
+        self._send_file_with_substitution(fpath, "text/html; charset=utf-8")
+
+    def _send_file_with_substitution(self, fpath, content_type):
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            for placeholder, value in _SUBSTITUTIONS.items():
+                content = content.replace(placeholder, value)
+            data = content.encode('utf-8')
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", len(data))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            logger.error("Failed to serve file %s: %s", fpath, e)
+            self._send_error(500, "Internal server error")
 
     def _serve_static(self, url_path):
         rel = url_path.replace("/static/", "", 1)
@@ -84,7 +119,10 @@ class BlockStoreDashboardHandler(BaseHTTPRequestHandler):
         elif fpath.endswith(".html"):
             ct = "text/html; charset=utf-8"
 
-        self._send_file(fpath, ct)
+        if fpath.endswith(".js") or fpath.endswith(".html"):
+            self._send_file_with_substitution(fpath, ct)
+        else:
+            self._send_file(fpath, ct)
 
     def _send_file(self, fpath, content_type):
         with open(fpath, "rb") as f:

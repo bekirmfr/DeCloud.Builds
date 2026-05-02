@@ -100,7 +100,7 @@ function renderStatus() {
     const dot  = document.getElementById('overall-status');
     const text = document.getElementById('status-text');
 
-    const ok = d.status === 'healthy' || d.status === 'ok';
+    const ok = d.status === 'active' || d.status === 'healthy' || d.status === 'ok';
     if (dot)  dot.className  = 'status-dot ' + (ok ? 'online' : 'offline');
     if (text) text.textContent = ok ? 'Operational' : (d.status || 'Unknown');
 }
