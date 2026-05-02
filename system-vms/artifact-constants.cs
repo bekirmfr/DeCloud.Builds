@@ -12,7 +12,7 @@
 // Paste this block inside the SystemVmTemplateSeeder class body.
 // Replace the COMPUTE_FROM_FILE placeholders with the generated values.
 
-// Generated: 2026-05-02T10:08:37Z
+// Generated: 2026-05-02T11:14:49Z
 
 // ── Shared ────────────────────────────────────────────────────────────────
     // shared/assets/wg-config-fetch.sh  (4649 bytes)
@@ -108,7 +108,7 @@
 
 
 // ── Summary ─────────────────────────────────────────────────────────────────
-// Generated: 2026-05-02T10:08:41Z
+// Generated: 2026-05-02T11:14:51Z
 // Roles discovered:
 //   shared/assets/ [prefix='<none>']: 2 files
 //   blockstore/assets/ [prefix='Blockstore']: 7 files

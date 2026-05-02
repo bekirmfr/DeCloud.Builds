@@ -116,7 +116,7 @@ write_files:
           }
 
           location ~ ^/(health|stats)$ {
-              proxy_pass http://127.0.0.1:__BLOCKSTORE_API_PORT__;
+              proxy_pass http://127.0.0.1:5090;
               proxy_set_header Host $host;
           }
       }
