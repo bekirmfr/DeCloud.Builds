@@ -25,6 +25,16 @@
 #   blockstore-node-arm64
 #   blockstore-node-arm64.sha256
 #
+# NOTE on decloud-agent (tenant attestation agent):
+#   The decloud-agent binary is NOT built by this workflow at present.
+#   Source for the existing binaries is missing and not currently in-tree
+#   (see implementation plan task P0.10 — "Recover or reconstruct
+#   decloud-agent source"). For now, decloud-agent-{amd64,arm64} binaries
+#   are manually uploaded to releases produced by this workflow (matching
+#   the binaries/v* tag scheme and SHA256 + URL conventions). When P0.10
+#   completes and source lands in tenant-vms/general/src/, a
+#   build-attestation-agent job will be added here mirroring build-dht.
+#
 # The .sha256 files are what P10's TemplateSeederService reads to
 # populate VmTemplate.Artifacts[].Sha256 at seeding time.
 #
@@ -42,7 +52,7 @@ on:
 
 permissions:
   contents: write   # required to create releases and upload assets
-  
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -228,6 +238,14 @@ jobs:
                 echo "| \`${binary}\` | \`${arch}\` | \`${sha}\` | [download](${url}) |"
               done
             done
+            echo ""
+            echo "### Manually-uploaded assets"
+            echo ""
+            echo "The following binaries are uploaded manually to this release"
+            echo "(see implementation plan P0.10 — source not yet reconstructed):"
+            echo ""
+            echo "- \`decloud-agent-amd64\` and \`decloud-agent-amd64.sha256\`"
+            echo "- \`decloud-agent-arm64\` and \`decloud-agent-arm64.sha256\`"
             echo ""
             echo "### What changed"
             echo ""
