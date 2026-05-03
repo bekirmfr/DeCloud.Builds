@@ -1,0 +1,28 @@
+# ============================================================
+# decloud-env-watcher@.timer
+#
+# Templated systemd timer. Instance name = role.
+#   systemctl enable --now decloud-env-watcher@dht.timer
+#   systemctl enable --now decloud-env-watcher@blockstore.timer
+#
+# Fires the watcher every 60 seconds starting 30 seconds after boot.
+# Lives in /etc/systemd/system/ on the VM. Installed by the role's
+# cloud-init runcmd.
+# ============================================================
+
+[Unit]
+Description=DeCloud Environment Watcher Timer (%i)
+
+[Timer]
+# Initial delay after boot — give cloud-init time to write the env file
+# and start the role service before the watcher polls for changes.
+OnBootSec=30s
+# Tick every 60s. Aligns with the design's drift-detection window.
+OnUnitActiveSec=60s
+# Allow up to 10s clock-skew tolerance — keeps the watcher loose, prevents
+# excess wakeups on systems with imprecise timers.
+AccuracySec=10s
+Unit=decloud-env-watcher@%i.service
+
+[Install]
+WantedBy=timers.target

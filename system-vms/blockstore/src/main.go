@@ -663,7 +663,7 @@ func setup(ctx context.Context, cfg Config) (*BlockNode, error) {
 		}
 	}
 
-	priv, err := loadOrCreateIdentity(StorageDir)
+	priv, err := loadIdentity(StorageDir)
 	if err != nil {
 		return nil, fmt.Errorf("identity: %w", err)
 	}
@@ -774,73 +774,54 @@ func setup(ctx context.Context, cfg Config) (*BlockNode, error) {
 // Identity
 // ═══════════════════════════════════════════════════════════════════
 
-// loadOrCreateIdentity loads the Ed25519 peer identity.
-// Priority: NodeAgent obligation state → disk cache → generate new.
-func loadOrCreateIdentity(dir string) (crypto.PrivKey, error) {
+// loadIdentity loads the Ed25519 peer identity from disk.
+//
+// The identity file is written by cloud-init at first boot from the NodeAgent
+// obligation state's ed25519PrivateKeyBase64 field. If the file is absent,
+// malformed, or wrong size, the binary fails fast — there is no fallback,
+// no self-creation, no HTTP fetch. cloud-init owns the file lifecycle.
+//
+// File format: raw 32-byte Ed25519 seed.
+//   cloud-init writes:  echo "$STATE" | jq -r '.ed25519PrivateKeyBase64' | base64 -d
+//   binary expects:     stded25519.SeedSize (32) bytes
+//
+// This binary expands the seed to the full 64-byte private key via
+// stded25519.NewKeyFromSeed before passing it to libp2p, which expects the
+// expanded form (matching the format produced by the obligation state's
+// HTTP path in earlier versions of this binary).
+//
+// See P0.9 in UNIFIED_CLOUDINIT_PIPELINE_IMPLEMENTATION_PLAN.md for the
+// rationale (one identity-fetch path across all roles, no fallback paths,
+// no silent identity divergence on transient failures).
+func loadIdentity(dir string) (crypto.PrivKey, error) {
 	keyPath := filepath.Join(dir, IdentityKeyFile)
 
-	// 1. NodeAgent obligation state — authoritative, survives redeployments
-	if priv, err := loadIdentityFromNodeAgent("blockstore"); err == nil {
-		log.Printf("Loaded BlockStore identity from NodeAgent obligation state")
-		cacheIdentityToDisk(priv, keyPath)
-		return priv, nil
-	} else {
-		log.Printf("NodeAgent obligation state unavailable (%v) — falling back to disk", err)
-	}
-
-	// 2. Disk cache
-	if data, err := os.ReadFile(keyPath); err == nil {
-		if priv, err := crypto.UnmarshalPrivateKey(data); err == nil {
-			log.Printf("Loaded cached identity from %s", keyPath)
-			return priv, nil
-		}
-	}
-
-	// 3. Generate new (first boot)
-	priv, _, err := crypto.GenerateEd25519Key(nil)
+	seed, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("generate identity key: %w", err)
+		return nil, fmt.Errorf("read identity from %s: %w", keyPath, err)
 	}
-	log.Printf("Generated new Ed25519 identity (obligation state not yet available)")
-	cacheIdentityToDisk(priv, keyPath)
+
+	if len(seed) != stded25519.SeedSize {
+		return nil, fmt.Errorf("identity file %s: expected %d-byte seed, got %d bytes",
+			keyPath, stded25519.SeedSize, len(seed))
+	}
+
+	fullKey := stded25519.NewKeyFromSeed(seed)
+	priv, err := crypto.UnmarshalEd25519PrivateKey(fullKey)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal Ed25519 key from %s: %w", keyPath, err)
+	}
+
+	log.Printf("Loaded BlockStore identity from %s", keyPath)
 	return priv, nil
 }
 
-func loadIdentityFromNodeAgent(role string) (crypto.PrivKey, error) {
-	gw, err := defaultGateway()
-	if err != nil {
-		return nil, fmt.Errorf("no default gateway: %w", err)
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://%s:5100/api/obligations/%s/state", gw, role))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	var state struct {
-		Ed25519PrivateKeyBase64 string `json:"ed25519PrivateKeyBase64"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		return nil, err
-	}
-	if state.Ed25519PrivateKeyBase64 == "" {
-		return nil, fmt.Errorf("empty ed25519PrivateKeyBase64")
-	}
-	seed, err := base64.StdEncoding.DecodeString(state.Ed25519PrivateKeyBase64)
-	if err != nil {
-		return nil, fmt.Errorf("decode Ed25519 seed: %w", err)
-	}
-	// obligation state stores a 32-byte seed — expand to 64-byte private key
-	// before passing to go-libp2p which expects the full expanded key.
-	if len(seed) == stded25519.SeedSize {
-		seed = stded25519.NewKeyFromSeed(seed)
-	}
-	return crypto.UnmarshalEd25519PrivateKey(seed)
-}
-
+// defaultGateway returns the IPv4 address of the default route's next hop.
+// Reads /proc/net/route directly (no shell-out). Used by runtime queries to
+// the NodeAgent obligation state endpoint (storage quota, auth token).
+//
+// NOTE: identity loading no longer uses this — see loadIdentity above.
+// cloud-init writes the identity file before the binary starts.
 func defaultGateway() (string, error) {
 	f, err := os.Open("/proc/net/route")
 	if err != nil {
@@ -860,15 +841,6 @@ func defaultGateway() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("default gateway not found")
-}
-
-func cacheIdentityToDisk(priv crypto.PrivKey, keyPath string) {
-	data, err := crypto.MarshalPrivateKey(priv)
-	if err != nil {
-		return
-	}
-	_ = os.MkdirAll(filepath.Dir(keyPath), 0o700)
-	_ = os.WriteFile(keyPath, data, 0600)
 }
 
 // isIPOnAnyInterface checks if ip is assigned to any local network interface.

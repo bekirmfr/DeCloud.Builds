@@ -2,7 +2,13 @@
 # DeCloud DHT VM Cloud-Init Configuration — Role Layer
 # Runs a libp2p Kademlia DHT node for peer discovery,
 # key-value storage, and GossipSub event propagation.
-# Version: 8.0
+# Version: 8.1
+#
+# Changes from 8.0:
+#   - P0.9 identity-fetch standardization: retry ceiling extended from
+#     2 minutes (24 × 5s) to 10 minutes (60 × 10s). Log message format
+#     normalized to match BlockStore and Relay (counter visible every
+#     retry). No format change to the identity file on disk.
 #
 # Changes from 7.0:
 #   - Stripped base content. Now a pure role layer; composes with
@@ -56,7 +62,7 @@ write_files:
         "advertise_ip": "__WG_TUNNEL_IP__",
         "wg_tunnel_ip": "__WG_TUNNEL_IP__",
         "created_at": "__TIMESTAMP__",
-        "version": "8.0",
+        "version": "8.1",
         "connectivity": "wireguard-mesh"
       }
 
@@ -149,20 +155,27 @@ write_files:
 runcmd:
   # ── DHT identity from NodeAgent obligation state ─────────────────────────
   # Fetches persistent Ed25519 keypair — same peer ID survives VM replacement.
+  # P0.9 standardization: 60 attempts × 10s = 10 min ceiling. Hard-fail on
+  # final timeout. Logs every retry so the wait is visible in journalctl.
   - |
     GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
     LOG="/var/log/decloud-dht-bootstrap.log"
     log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] dht-identity: $*" | tee -a "$LOG"; }
     log "Fetching DHT identity from NodeAgent obligation state..."
     ATTEMPTS=0
+    MAX_ATTEMPTS=60
     STATE=""
-    while [ $ATTEMPTS -lt 24 ] && [ -z "$STATE" ]; do
+    while [ $ATTEMPTS -lt $MAX_ATTEMPTS ] && [ -z "$STATE" ]; do
       STATE=$(curl -sf --max-time 5 \
           "http://${GATEWAY}:5100/api/obligations/dht/state" 2>/dev/null || echo "")
-      [ -z "$STATE" ] && log "Not ready — retrying in 5s (attempt $((ATTEMPTS+1))/24)" && sleep 5 && ATTEMPTS=$((ATTEMPTS+1))
+      if [ -z "$STATE" ]; then
+        ATTEMPTS=$((ATTEMPTS+1))
+        log "Not ready — retrying in 10s (attempt ${ATTEMPTS}/${MAX_ATTEMPTS})"
+        sleep 10
+      fi
     done
     if [ -z "$STATE" ]; then
-      log "FATAL: DHT identity unavailable after 2 minutes"
+      log "FATAL: DHT identity unavailable after 10 minutes — aborting cloud-init"
       exit 1
     fi
     mkdir -p /var/lib/decloud-dht && chmod 700 /var/lib/decloud-dht

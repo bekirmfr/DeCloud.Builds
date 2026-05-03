@@ -1,8 +1,18 @@
 #cloud-config
 # DeCloud Block Store VM Cloud-Init Configuration — Role Layer
 # Runs a libp2p BitSwap block store node for content-addressed storage.
-# Version: 4.0
+# Version: 4.1
 #
+# Changes from 4.0:
+#   - P0.9 identity-fetch standardization: cloud-init now fetches obligation
+#     state and writes /var/lib/decloud-blockstore/identity.key before the
+#     binary starts. 60 attempts × 10s = 10 min ceiling, hard-fail on timeout.
+#     **Coordinated binary change required:** blockstore-node v4.1+ reads the
+#     file at startup; no HTTP client, no self-create. Both halves land in
+#     one commit.
+#   - Identity file format: raw 32-byte Ed25519 seed (matches DHT pattern).
+#     Binary expands to full 64-byte key via stded25519.NewKeyFromSeed.
+
 # Changes from 3.0:
 #   - Stripped base content. Now a pure role layer; composes with
 #     base-templates/base-system-mesh.yaml at template-seed time via
@@ -23,11 +33,10 @@
 #         bootstrap-poll service
 #       * runcmd: artifact fetch, wg-config-fetch invocation,
 #         daemon-reload, nginx + service starts, log echo
-#   - No identity-fetch runcmd at this stage. Preserves current behavior:
-#     blockstore-node binary self-loads identity via loadOrCreateIdentity()
-#     against NodeAgent obligation state at runtime. P0.9 standardization
-#     will add a cloud-init identity-fetch block here and remove the binary
-#     self-create path (coordinated change with the binary).
+#   - **(v4.0)** No identity-fetch runcmd. Binary self-loaded identity via
+#     loadOrCreateIdentity() against NodeAgent obligation state at runtime.
+#   - **(v4.1, P0.9)** Identity-fetch runcmd added; binary became file-reader.
+#     See "Changes from 4.0" above.
 #
 # This file is NOT deployed standalone. Composed with base-system-mesh.yaml.
 
@@ -56,7 +65,7 @@ write_files:
         "listen_port": __BLOCKSTORE_LISTEN_PORT__,
         "api_port": __BLOCKSTORE_API_PORT__,
         "created_at": "__TIMESTAMP__",
-        "version": "4.0",
+        "version": "4.1",
         "connectivity": "wireguard-mesh"
       }
 
@@ -156,6 +165,42 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+  # ── BlockStore identity from NodeAgent obligation state ──────────────────
+  # P0.9 standardization: cloud-init writes the identity file BEFORE the
+  # binary starts. blockstore-node binary reads /var/lib/decloud-blockstore/
+  # identity.key at startup; no HTTP client in binary, no self-create.
+  # 60 attempts × 10s = 10 min ceiling. Hard-fail on final timeout.
+  #
+  # Format: raw 32-byte Ed25519 seed (decoded from obligation state's
+  # ed25519PrivateKeyBase64). Binary expands to full 64-byte key at read time.
+  - |
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+    LOG="/var/log/decloud-blockstore-bootstrap.log"
+    log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] blockstore-identity: $*" | tee -a "$LOG"; }
+    log "Fetching BlockStore identity from NodeAgent obligation state..."
+    ATTEMPTS=0
+    MAX_ATTEMPTS=60
+    STATE=""
+    while [ $ATTEMPTS -lt $MAX_ATTEMPTS ] && [ -z "$STATE" ]; do
+      STATE=$(curl -sf --max-time 5 \
+          "http://${GATEWAY}:5100/api/obligations/blockstore/state" 2>/dev/null || echo "")
+      if [ -z "$STATE" ]; then
+        ATTEMPTS=$((ATTEMPTS+1))
+        log "Not ready — retrying in 10s (attempt ${ATTEMPTS}/${MAX_ATTEMPTS})"
+        sleep 10
+      fi
+    done
+    if [ -z "$STATE" ]; then
+      log "FATAL: BlockStore identity unavailable after 10 minutes — aborting cloud-init"
+      exit 1
+    fi
+    mkdir -p /var/lib/decloud-blockstore && chmod 700 /var/lib/decloud-blockstore
+    echo "$STATE" | jq -r '.ed25519PrivateKeyBase64' | base64 -d \
+        > /var/lib/decloud-blockstore/identity.key
+    chmod 600 /var/lib/decloud-blockstore/identity.key
+    PEER_ID=$(echo "$STATE" | jq -r '.peerId // "unknown"')
+    log "BlockStore identity loaded (peerId: ${PEER_ID})"
+
   # ── Artifacts from local cache (pre-fetched by node agent before deploy) ──
   # ${ARTIFACT_URL:name} is substituted by SystemVmReconciler.SubstituteArtifactVariables
   # to http://192.168.122.1:5100/api/artifacts/{sha256} before the VM is created.

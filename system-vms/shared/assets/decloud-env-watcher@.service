@@ -1,0 +1,27 @@
+# ============================================================
+# decloud-env-watcher@.service
+#
+# Templated systemd service. Instance name = role.
+#   systemctl enable --now decloud-env-watcher@dht.timer
+#   systemctl enable --now decloud-env-watcher@blockstore.timer
+#
+# Triggered by decloud-env-watcher@.timer. One-shot: runs the watcher
+# script, exits, waits for next timer tick.
+#
+# Lives in /etc/systemd/system/ on the VM. Installed by the role's
+# cloud-init runcmd.
+# ============================================================
+
+[Unit]
+Description=DeCloud Environment Watcher (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/decloud-env-watcher.sh %i
+StandardOutput=journal
+StandardError=journal
+# The script handles its own retry semantics via the timer; failures here
+# (e.g. endpoint unreachable) are not service failures.
+SuccessExitStatus=0 1

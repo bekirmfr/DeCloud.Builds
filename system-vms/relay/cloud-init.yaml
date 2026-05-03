@@ -1,6 +1,25 @@
 #cloud-config
 # DeCloud Relay VM Cloud-Init Configuration — Role Layer
-# Version: 6.0
+# Version: 6.1
+#
+# Changes from 6.0:
+#   - P0.9 identity-fetch standardization. Removed:
+#       * write_files: /etc/wireguard/wg-relay-server.conf (label-baked
+#         __WIREGUARD_PRIVATE_KEY__ placeholder)
+#       * write_files: /etc/wireguard/private.key, /etc/wireguard/public.key
+#         (label-baked WG keypair)
+#       * write_files: /etc/decloud/relay-subnet (label-baked __RELAY_SUBNET__)
+#       * runcmd: sed-rewrite-from-obligation-state block with fallback
+#         to label-baked key
+#     Added:
+#       * runcmd: identity-fetch block matching DHT/BlockStore pattern
+#         (60×10s = 10 min ceiling, hard-fail on timeout, no fallback).
+#         Writes private.key, public.key, relay-subnet from obligation state,
+#         then renders wg-relay-server.conf via heredoc.
+#   - relay-metadata.json: still rendered with __RELAY_SUBNET__ and
+#     __WIREGUARD_PUBLIC_KEY__ at cloud-init render time (option 1 from §2
+#     decision log) — documentary metadata, not source of truth. The runtime
+#     /etc/wireguard/* and /etc/decloud/relay-subnet files are authoritative.
 #
 # Changes from 5.1:
 #   - Stripped base content. Now a pure role layer; composes with
@@ -43,57 +62,12 @@ packages:
   - fail2ban
 
 write_files:
-  # WireGuard configuration (includes orchestrator as peer)
-  - path: /etc/wireguard/wg-relay-server.conf
-    permissions: '0600'
-    content: |
-      [Interface]
-      # Relay server listening on all interfaces
-      # Each relay gets unique subnet: 10.20.{1-254}.0/24
-      # This relay's subnet: __RELAY_SUBNET__
-      Address = 10.20.__RELAY_SUBNET__.254/24
-      PrivateKey = __WIREGUARD_PRIVATE_KEY__
-      ListenPort = 51820
-
-      # Enable IP forwarding
-      PostUp = iptables -A FORWARD -i wg-relay-server -j ACCEPT
-      PostUp = iptables -A FORWARD -o wg-relay-server -j ACCEPT
-      PostUp = bash -c 'DEFAULT_IFACE=$(ip route | grep default | awk "{print \$5}"); iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE'
-      # Block SSH to relay VM via tunnel (prevents interception of forwarded SSH)
-      PostUp = iptables -A INPUT -i wg-relay-server -p tcp --dport 22 -j DROP
-      PreDown = iptables -D FORWARD -i wg-relay-server -j ACCEPT
-      PreDown = iptables -D FORWARD -o wg-relay-server -j ACCEPT
-      PreDown = bash -c 'DEFAULT_IFACE=$(ip route | grep default | awk "{print \$5}"); iptables -t nat -D POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE'
-      PreDown = iptables -D INPUT -i wg-relay-server -p tcp --dport 22 -j DROP
-
-      # Orchestrator peer (pre-configured during provisioning)
-      [Peer]
-      # DeCloud Orchestrator
-      PublicKey = __ORCHESTRATOR_PUBLIC_KEY__
-      Endpoint = __ORCHESTRATOR_IP__:__ORCHESTRATOR_PORT__
-      # Orchestrator always uses 10.20.0.1, not per-subnet IP
-      AllowedIPs = 10.20.0.1/32
-      PersistentKeepalive = 25
-
-      # NOTE: CGNAT nodes will be added dynamically by relay API
-
-  # Store relay private key separately
-  - path: /etc/wireguard/private.key
-    permissions: '0600'
-    content: |
-      __WIREGUARD_PRIVATE_KEY__
-
-  # Store relay public key
-  - path: /etc/wireguard/public.key
-    permissions: '0644'
-    content: |
-      __WIREGUARD_PUBLIC_KEY__
-
-  # Store relay subnet for reference
-  - path: /etc/decloud/relay-subnet
-    permissions: '0644'
-    content: |
-      __RELAY_SUBNET__
+  # NOTE (P0.9): /etc/wireguard/wg-relay-server.conf, /etc/wireguard/private.key,
+  # /etc/wireguard/public.key, and /etc/decloud/relay-subnet are NOT baked in
+  # via cloud-init substitution. They are written by the identity-fetch runcmd
+  # block below from the NodeAgent obligation state's authoritative values,
+  # then wg-quick is started. Eliminates label-baked secrets and the format
+  # fragility of base64 in cloud-init labels.
 
   # Nginx reverse proxy configuration
   # Port 80 multiplexes two services based on Host header:
@@ -387,7 +361,7 @@ write_files:
         "wireguard_public_key": "__WIREGUARD_PUBLIC_KEY__",
         "orchestrator_public_key": "__ORCHESTRATOR_PUBLIC_KEY__",
         "created_at": "__TIMESTAMP__",
-        "version": "6.0"
+        "version": "6.1"
       }
 
 runcmd:
@@ -401,51 +375,82 @@ runcmd:
   - systemctl stop ufw || true
   - systemctl disable ufw || true
 
-  # Rewrite WireGuard config with identity from NodeAgent obligation state.
-  # Ensures the relay uses its persistent keypair (not the label-baked placeholder)
-  # so CGNAT nodes don't need to re-register when the relay VM is replaced.
+  # ── Relay identity from NodeAgent obligation state ──────────────────────
+  # P0.9 standardization. Cloud-init fetches obligation state, writes WG keypair
+  # + subnet files, renders wg-relay-server.conf from those values, then starts
+  # wg-quick. No label-baked secrets, no sed-rewrite, no fallback path.
+  # 60 attempts × 10s = 10 min ceiling. Hard-fail on final timeout.
   #
-  # NOTE (P0.9): This sed-rewrite-from-obligation-state pattern will be replaced
-  # with the standardized identity-fetch pattern (cloud-init writes the WG key
-  # file from obligation state directly; no label-baked key, no sed rewrite).
-  # Preserved here as v5.1-equivalent behavior for the structural strip.
+  # The orchestrator placeholders (__ORCHESTRATOR_*) inside the heredoc are
+  # resolved by CloudInitRenderer at render time, before this script runs.
+  # Bash variable references inside the heredoc ($DEFAULT_IFACE, $5) are
+  # escaped to defer expansion to runtime when wg-quick reads the config.
   - |
     GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
-    for i in $(seq 1 24); do
+    LOG="/var/log/decloud-relay-bootstrap.log"
+    log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] relay-identity: $*" | tee -a "$LOG"; }
+    log "Fetching Relay identity from NodeAgent obligation state..."
+    ATTEMPTS=0
+    MAX_ATTEMPTS=60
+    STATE=""
+    while [ $ATTEMPTS -lt $MAX_ATTEMPTS ] && [ -z "$STATE" ]; do
       STATE=$(curl -sf --max-time 5 \
-          "http://${GATEWAY}:5100/api/obligations/relay/state" 2>/dev/null || true)
-      WG_PRIV=$(echo "$STATE" | jq -r '.wireGuardPrivateKey // empty' 2>/dev/null || true)
-      WG_PUB=$(echo "$STATE"  | jq -r '.wireGuardPublicKey  // empty' 2>/dev/null || true)
-      SUBNET=$(echo "$STATE"  | jq -r '.relaySubnet         // empty' 2>/dev/null || true)
-      [ -n "$WG_PRIV" ] && break
-      sleep 5
+          "http://${GATEWAY}:5100/api/obligations/relay/state" 2>/dev/null || echo "")
+      if [ -z "$STATE" ]; then
+        ATTEMPTS=$((ATTEMPTS+1))
+        log "Not ready — retrying in 10s (attempt ${ATTEMPTS}/${MAX_ATTEMPTS})"
+        sleep 10
+      fi
     done
-    if [ -n "$WG_PRIV" ]; then
-      if echo "$SUBNET" | grep -qE '^[0-9]+$'; then
-        SUBNET_OCTET="$SUBNET"
-      else
-        SUBNET_OCTET=$(echo "$SUBNET" | cut -d'.' -f3)
-      fi
-      [ -z "$SUBNET_OCTET" ] && SUBNET_OCTET=$(cat /etc/decloud/relay-subnet 2>/dev/null | tr -d '\n')
-      [ -z "$SUBNET_OCTET" ] && SUBNET_OCTET="248"
-      sed -i \
-          -e "s|^PrivateKey = .*|PrivateKey = ${WG_PRIV}|" \
-          -e "s|^Address = .*|Address = 10.20.${SUBNET_OCTET}.254/24|" \
-          /etc/wireguard/wg-relay-server.conf
-      printf '%s\n' "$WG_PRIV" > /etc/wireguard/private.key
-      printf '%s\n' "$WG_PUB"  > /etc/wireguard/public.key
-      printf '%s\n' "$SUBNET_OCTET" > /etc/decloud/relay-subnet
-      if [ -f /etc/decloud/relay-metadata.json ]; then
-        sed -i \
-            -e "s|\"wireguard_public_key\": \"[^\"]*\"|\"wireguard_public_key\": \"${WG_PUB}\"|" \
-            -e "s|\"relay_subnet\": [0-9]*|\"relay_subnet\": ${SUBNET_OCTET}|" \
-            -e "s|\"tunnel_ip\": \"[^\"]*\"|\"tunnel_ip\": \"10.20.${SUBNET_OCTET}.254\"|" \
-            /etc/decloud/relay-metadata.json
-      fi
-      echo "Relay identity updated from obligation state (pubkey: $(printf '%.16s' "$WG_PUB")..., subnet: ${SUBNET_OCTET})"
-    else
-      echo "WARNING: NodeAgent obligation state unavailable — using label-baked WG key"
+    if [ -z "$STATE" ]; then
+      log "FATAL: Relay identity unavailable after 10 minutes — aborting cloud-init"
+      exit 1
     fi
+    WG_PRIV=$(echo "$STATE" | jq -r '.wireGuardPrivateKey // empty')
+    WG_PUB=$(echo "$STATE"  | jq -r '.wireGuardPublicKey  // empty')
+    SUBNET=$(echo "$STATE"  | jq -r '.relaySubnet         // empty')
+    if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$SUBNET" ]; then
+      log "FATAL: obligation state missing required fields (wireGuardPrivateKey/PublicKey/relaySubnet)"
+      exit 1
+    fi
+    if echo "$SUBNET" | grep -qE '^[0-9]+$'; then
+      SUBNET_OCTET="$SUBNET"
+    else
+      SUBNET_OCTET=$(echo "$SUBNET" | cut -d'.' -f3)
+    fi
+    if [ -z "$SUBNET_OCTET" ]; then
+      log "FATAL: could not derive subnet octet from '$SUBNET'"
+      exit 1
+    fi
+    mkdir -p /etc/wireguard /etc/decloud
+    printf '%s\n' "$WG_PRIV"      > /etc/wireguard/private.key
+    printf '%s\n' "$WG_PUB"       > /etc/wireguard/public.key
+    printf '%s\n' "$SUBNET_OCTET" > /etc/decloud/relay-subnet
+    chmod 600 /etc/wireguard/private.key
+    chmod 644 /etc/wireguard/public.key /etc/decloud/relay-subnet
+    cat > /etc/wireguard/wg-relay-server.conf << EOF
+    [Interface]
+    Address = 10.20.${SUBNET_OCTET}.254/24
+    PrivateKey = ${WG_PRIV}
+    ListenPort = 51820
+
+    PostUp = iptables -A FORWARD -i wg-relay-server -j ACCEPT
+    PostUp = iptables -A FORWARD -o wg-relay-server -j ACCEPT
+    PostUp = bash -c 'DEFAULT_IFACE=\$(ip route | grep default | awk "{print \\\$5}"); iptables -t nat -A POSTROUTING -o \$DEFAULT_IFACE -j MASQUERADE'
+    PostUp = iptables -A INPUT -i wg-relay-server -p tcp --dport 22 -j DROP
+    PreDown = iptables -D FORWARD -i wg-relay-server -j ACCEPT
+    PreDown = iptables -D FORWARD -o wg-relay-server -j ACCEPT
+    PreDown = bash -c 'DEFAULT_IFACE=\$(ip route | grep default | awk "{print \\\$5}"); iptables -t nat -D POSTROUTING -o \$DEFAULT_IFACE -j MASQUERADE'
+    PreDown = iptables -D INPUT -i wg-relay-server -p tcp --dport 22 -j DROP
+
+    [Peer]
+    PublicKey = __ORCHESTRATOR_PUBLIC_KEY__
+    Endpoint = __ORCHESTRATOR_IP__:__ORCHESTRATOR_PORT__
+    AllowedIPs = 10.20.0.1/32
+    PersistentKeepalive = 25
+    EOF
+    chmod 600 /etc/wireguard/wg-relay-server.conf
+    log "Relay identity loaded (pubkey: $(printf '%.16s' "$WG_PUB")..., subnet: ${SUBNET_OCTET})"
 
   - systemctl enable wg-quick@wg-relay-server
   - systemctl start wg-quick@wg-relay-server
