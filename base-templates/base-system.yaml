@@ -1,0 +1,69 @@
+#cloud-config
+
+# DeCloud System-VM Base Layer
+#
+# Composed by TemplateComposer with role layers (relay, dht, blockstore)
+# at template-seed time. Provides infrastructure primitives common to ALL
+# system VMs:
+#   - Universal hostname / SSH key handling (no password auth)
+#   - snapd/LXD mask (system VMs are headless workers; snapd adds ~50s boot)
+#   - Standard package set (covers WireGuard for any wg-quick service —
+#     relay uses wg-relay-server, DHT/BlockStore use wg-mesh)
+#
+# Role layers add:
+#   - role-specific env files (/etc/decloud-{role}/, /etc/decloud/wg-mesh.env, etc.)
+#   - role-specific systemd units, nginx config
+#   - role-specific artifact fetches and identity setup
+#   - role-specific service starts
+#   - WireGuard mesh participation (for DHT/BlockStore — relay does not
+#     participate in the mesh, it IS the mesh hub for its subnet)
+#
+# This file is NOT deployed standalone.
+
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+
+# System VMs do not auto-update; we control the image and boot artifacts.
+package_update: false
+package_upgrade: false
+
+bootcmd:
+  - rm -f /etc/machine-id /var/lib/dbus/machine-id
+  - systemd-machine-id-setup
+  # Mask snapd/LXD — unused in system VMs, adds ~50s boot delay.
+  - systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service lxd.service lxd-agent.service 2>/dev/null || true
+  # Start guest agent as early as possible so the orchestrator's readiness
+  # monitor can track cloud-init progress before packages install.
+  - systemctl start qemu-guest-agent 2>/dev/null || true
+
+# System VMs run as root; no separate user. SSH password auth is disabled —
+# operators connect via SSH certificate authority only.
+disable_root: false
+__SSH_AUTHORIZED_KEYS_BLOCK__
+ssh_pwauth: false
+
+# Universal package set across relay, DHT, BlockStore.
+# wireguard / wireguard-tools: needed by relay (wg-quick@wg-relay-server) AND
+#   by DHT/BlockStore (wg-quick@wg-mesh). Putting in base, not role layers.
+# fail2ban: NOT in base — it's relay-specific (the only system VM with public
+#   SSH exposure).
+packages:
+  - qemu-guest-agent
+  - curl
+  - jq
+  - openssl
+  - nginx-light
+  - wireguard
+  - wireguard-tools
+  - python3
+
+runcmd:
+  # Start QEMU guest agent (static unit — systemctl enable fails silently,
+  # use direct symlink instead).
+  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+  - systemctl start qemu-guest-agent || true
+
+  # NOTE: Mesh-participant roles (DHT, BlockStore) add their own runcmd block
+  # for wg-config-fetch.sh invocation. Relay's role layer adds its own runcmd
+  # for wg-relay-server config rewrite from obligation state.
+  # TemplateComposer concatenates base runcmd before role runcmd.

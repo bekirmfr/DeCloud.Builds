@@ -1,0 +1,48 @@
+#cloud-config
+
+# DeCloud General VM Role Layer
+#
+# Composed with base-tenant.yaml by TemplateComposer at seed time to form
+# the platform-general VmTemplate.
+#
+# Provides the welcome landing page that gives a freshly-deployed general VM
+# something to show on port 80. Marketplace VMs do not include this layer —
+# they bring their own application.
+#
+# This file is NOT deployed standalone.
+
+write_files:
+  # Welcome page systemd service.
+  # ExecStart references /usr/local/bin/welcome-server.py, which is fetched
+  # from the artifact pipeline in runcmd below.
+  - path: /etc/systemd/system/welcome.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud Welcome Page with Caching
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/welcome-server.py
+      Restart=always
+      WorkingDirectory=/var/www
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Fetch welcome page assets from the node-local artifact cache.
+  # ${ARTIFACT_URL:general-index} and ${ARTIFACT_URL:general-api} resolve at
+  # render time to http://192.168.122.1:5100/api/artifacts/<sha256> URLs.
+  - mkdir -p /var/www
+  - curl -sf "${ARTIFACT_URL:general-index}" -o /var/www/index.html
+  - chmod 644 /var/www/index.html
+  - curl -sf "${ARTIFACT_URL:general-api}" -o /usr/local/bin/welcome-server.py
+  - chmod +x /usr/local/bin/welcome-server.py
+
+  # Start welcome page service (direct symlink — systemctl enable unreliable
+  # on Debian 12, consistent with qemu-guest-agent pattern in base-tenant).
+  - ln -sf /etc/systemd/system/welcome.service /etc/systemd/system/multi-user.target.wants/welcome.service
+  - systemctl start welcome

@@ -1,0 +1,157 @@
+#cloud-config
+
+# DeCloud System-VM Base Layer (Mesh-Participant)
+#
+# Composed by TemplateComposer with role layers (dht, blockstore) at
+# template-seed time. For system VMs that participate in the WireGuard
+# mesh as a peer.
+#
+# Sibling to base-system.yaml. The two are parallel base primitives:
+#
+#   base-system.yaml         → relay (the mesh hub, no mesh participation)
+#   base-system-mesh.yaml    → DHT, BlockStore (mesh participants)
+#
+# Each role composes against exactly one base. The universal system-VM
+# content (scalars, bootcmd, qemu-guest-agent, packages) appears in both
+# files — discipline note: changes to universal content must land in both.
+#
+# Adds, beyond what base-system.yaml provides:
+#   - /etc/decloud/wg-mesh.env (consumed by wg-config-fetch.sh and wg-quick@wg-mesh)
+#   - wg-mesh-watchdog systemd unit + timer + script
+#   - wg-quick@wg-mesh.service.d/override.conf
+#
+# Two role-specific values inside wg-mesh.env (WG_DESCRIPTION, DECLOUD_ROLE)
+# are declared `Static` variables on the role's template, with concrete
+# DefaultValue set by the role's seeder (e.g. WG_DESCRIPTION="DHT-__VM_ID__",
+# DECLOUD_ROLE="dht"). They are rendered by CloudInitRenderer at orchestrator
+# render time, not by TemplateComposer at seed time.
+#
+# This file is NOT deployed standalone.
+
+hostname: __HOSTNAME__
+manage_etc_hosts: true
+
+# System VMs do not auto-update; we control the image and boot artifacts.
+package_update: false
+package_upgrade: false
+
+bootcmd:
+  - rm -f /etc/machine-id /var/lib/dbus/machine-id
+  - systemd-machine-id-setup
+  # Mask snapd/LXD — unused in system VMs, adds ~50s boot delay.
+  - systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service lxd.service lxd-agent.service 2>/dev/null || true
+  # Start guest agent as early as possible so the orchestrator's readiness
+  # monitor can track cloud-init progress before packages install.
+  - systemctl start qemu-guest-agent 2>/dev/null || true
+
+# System VMs run as root; no separate user. SSH password auth is disabled —
+# operators connect via SSH certificate authority only.
+disable_root: false
+__SSH_AUTHORIZED_KEYS_BLOCK__
+ssh_pwauth: false
+
+# Universal system-VM package set + WireGuard tooling for wg-quick@wg-mesh.
+packages:
+  - qemu-guest-agent
+  - curl
+  - jq
+  - openssl
+  - nginx-light
+  - wireguard
+  - wireguard-tools
+  - python3
+
+write_files:
+  # WireGuard mesh environment.
+  # Consumed by /usr/local/bin/wg-config-fetch.sh (fetched by role layer's
+  # artifact pipeline) and by wg-quick@wg-mesh via the override below.
+  # WG_DESCRIPTION and DECLOUD_ROLE are role-specific declared statics —
+  # CloudInitRenderer fills them at orchestrator render time.
+  - path: /etc/decloud/wg-mesh.env
+    permissions: '0600'
+    content: |
+      WG_RELAY_ENDPOINT=__WG_RELAY_ENDPOINT__
+      WG_RELAY_PUBKEY=__WG_RELAY_PUBKEY__
+      WG_TUNNEL_IP=__WG_TUNNEL_IP__
+      WG_RELAY_API=__WG_RELAY_API__
+      WG_INTERFACE=wg-mesh
+      WG_DESCRIPTION=__WG_DESCRIPTION__
+      WG_PEER_TYPE=system-vm
+      WG_PARENT_NODE_ID=__NODE_ID__
+      WG_ROLE=__DECLOUD_ROLE__
+
+  # WireGuard mesh watchdog systemd unit.
+  - path: /etc/systemd/system/wg-mesh-watchdog.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=WireGuard Mesh Connectivity Watchdog
+      After=wg-quick@wg-mesh.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/wg-mesh-watchdog.sh
+      StandardOutput=journal
+      StandardError=journal
+
+  - path: /etc/systemd/system/wg-mesh-watchdog.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=WireGuard Mesh Watchdog Timer
+      After=wg-quick@wg-mesh.service
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=2min
+      AccuracySec=30s
+
+      [Install]
+      WantedBy=timers.target
+
+  # wg-quick override: swap the default ExecStart for our enrollment script.
+  # /usr/local/bin/wg-mesh-enroll.sh is fetched by the role layer's artifact
+  # pipeline before this unit is started.
+  - path: /etc/systemd/system/wg-quick@wg-mesh.service.d/override.conf
+    permissions: '0644'
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/bin/bash -c '/usr/local/bin/wg-mesh-enroll.sh || true'
+      RemainAfterExit=yes
+
+  # Inline watchdog script — static (no placeholders, no artifact fetch).
+  - path: /usr/local/bin/wg-mesh-watchdog.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      WG_INTERFACE="wg-mesh"
+      STALE_THRESHOLD=180
+
+      if ! wg show "$WG_INTERFACE" &>/dev/null; then
+          echo "[wg-watchdog] Interface not up — re-enrolling"
+          /usr/local/bin/wg-mesh-enroll.sh
+          exit 0
+      fi
+
+      LAST_HANDSHAKE=$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+      NOW=$(date +%s)
+      AGE=$(( NOW - ${LAST_HANDSHAKE:-0} ))
+
+      if [ "${LAST_HANDSHAKE:-0}" -eq 0 ] || [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
+          echo "[wg-watchdog] Handshake stale (${AGE}s) — re-enrolling"
+          /usr/local/bin/wg-mesh-enroll.sh
+      else
+          echo "[wg-watchdog] Handshake OK (${AGE}s ago)"
+      fi
+
+runcmd:
+  # Start QEMU guest agent (static unit — systemctl enable fails silently,
+  # use direct symlink instead).
+  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+  - systemctl start qemu-guest-agent || true
+
+  # NOTE: The wg-config-fetch.sh invocation lives in the role layer's runcmd,
+  # because the script itself is fetched via the role's role-specific artifact
+  # pipeline and isn't installed by the time base runcmd executes.
+  # TemplateComposer concatenates base runcmd before role runcmd.

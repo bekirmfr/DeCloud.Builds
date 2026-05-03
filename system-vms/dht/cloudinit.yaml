@@ -1,52 +1,32 @@
 #cloud-config
-# DeCloud DHT VM Cloud-Init Configuration
+# DeCloud DHT VM Cloud-Init Configuration — Role Layer
 # Runs a libp2p Kademlia DHT node for peer discovery,
 # key-value storage, and GossipSub event propagation.
-# Version: 7.0
+# Version: 8.0
 #
-# Changes from 6.0:
-#   - Removed: gz+b64 binary write_files entry
-#   - Removed: script placeholder write_files entries
-#     (__DHT_DASHBOARD_PY__, __WG_MESH_ENROLL__, __WG_CONFIG_FETCH__,
-#      __DHT_BOOTSTRAP_POLL__, __DHT_DASHBOARD_HTML/CSS/JS__)
-#   - Added: identity fetch from NodeAgent obligation state API
-#   - Added: artifact downloads via artifact cache (curl by SHA256)
-#   - bootcmd: start qemu-guest-agent early (before packages)
-#   - artifact downloads: curl -f (not -sf) inside set -e block —
-#     missing artifact halts cloud-init immediately with clear error
-
-hostname: __HOSTNAME__
-manage_etc_hosts: true
-
-package_update: false
-package_upgrade: false
-
-bootcmd:
-  - rm -f /etc/machine-id /var/lib/dbus/machine-id
-  - systemd-machine-id-setup
-  # Mask snapd/LXD — unused in system VMs, adds ~50s boot delay
-  - systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service lxd.service lxd-agent.service 2>/dev/null || true
-  # Start guest agent as early as possible so readiness monitor can track
-  # cloud-init progress before packages are even installed.
-  - systemctl start qemu-guest-agent 2>/dev/null || true
-
-disable_root: false
-__SSH_AUTHORIZED_KEYS_BLOCK__
-ssh_pwauth: false
-
-packages:
-  - qemu-guest-agent
-  - curl
-  - jq
-  - openssl
-  - nginx-light
-  - wireguard
-  - wireguard-tools
-  - python3
+# Changes from 7.0:
+#   - Stripped base content. Now a pure role layer; composes with
+#     base-templates/base-system-mesh.yaml at template-seed time via
+#     TemplateComposer. The composed result is structurally equivalent
+#     to v7.0 of this file.
+#   - Removed (now in base-system-mesh.yaml):
+#       * scalars: hostname, manage_etc_hosts, package_update/upgrade,
+#         disable_root, ssh_pwauth, __SSH_AUTHORIZED_KEYS_BLOCK__
+#       * bootcmd entries (machine-id, snapd/LXD mask, qemu-guest-agent)
+#       * packages list (8 packages)
+#       * write_files: /etc/decloud/wg-mesh.env, wg-mesh-watchdog.{service,
+#         timer,sh}, wg-quick@wg-mesh.service.d/override.conf
+#       * runcmd: qemu-guest-agent symlink + start
+#   - Kept (role-specific):
+#       * write_files: /etc/decloud-dht/dht.env, dht-metadata.json,
+#         nginx site config, decloud-dht.service, dashboard service,
+#         bootstrap-poll service
+#       * runcmd: identity fetch, artifact fetch, wg-config-fetch
+#         invocation, daemon-reload, nginx + service starts, log echo
+#
+# This file is NOT deployed standalone. Composed with base-system-mesh.yaml.
 
 write_files:
-  # Static config only — binary and scripts downloaded from artifact cache below
-
   - path: /etc/decloud-dht/dht.env
     permissions: '0644'
     content: |
@@ -63,19 +43,6 @@ write_files:
       DHT_MESH_MIN_PEERS=1
       DHT_MESH_STALENESS_SEC=300
 
-  - path: /etc/decloud/wg-mesh.env
-    permissions: '0600'
-    content: |
-      WG_RELAY_ENDPOINT=__WG_RELAY_ENDPOINT__
-      WG_RELAY_PUBKEY=__WG_RELAY_PUBKEY__
-      WG_TUNNEL_IP=__WG_TUNNEL_IP__
-      WG_RELAY_API=__WG_RELAY_API__
-      WG_INTERFACE=wg-mesh
-      WG_DESCRIPTION=DHT-__VM_ID__
-      WG_PEER_TYPE=system-vm
-      WG_PARENT_NODE_ID=__NODE_ID__
-      WG_ROLE=dht
-
   - path: /etc/decloud/dht-metadata.json
     permissions: '0644'
     content: |
@@ -89,7 +56,7 @@ write_files:
         "advertise_ip": "__WG_TUNNEL_IP__",
         "wg_tunnel_ip": "__WG_TUNNEL_IP__",
         "created_at": "__TIMESTAMP__",
-        "version": "7.0",
+        "version": "8.0",
         "connectivity": "wireguard-mesh"
       }
 
@@ -179,71 +146,7 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
-  - path: /etc/systemd/system/wg-mesh-watchdog.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=WireGuard Mesh Connectivity Watchdog
-      After=wg-quick@wg-mesh.service
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/bin/wg-mesh-watchdog.sh
-      StandardOutput=journal
-      StandardError=journal
-
-  - path: /etc/systemd/system/wg-mesh-watchdog.timer
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=WireGuard Mesh Watchdog Timer
-      After=wg-quick@wg-mesh.service
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitActiveSec=2min
-      AccuracySec=30s
-
-      [Install]
-      WantedBy=timers.target
-
-  - path: /etc/systemd/system/wg-quick@wg-mesh.service.d/override.conf
-    permissions: '0644'
-    content: |
-      [Service]
-      ExecStart=
-      ExecStart=/bin/bash -c '/usr/local/bin/wg-mesh-enroll.sh || true'
-      RemainAfterExit=yes
-
-  # Inline watchdog script (static — no placeholder pattern, no artifact needed)
-  - path: /usr/local/bin/wg-mesh-watchdog.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      WG_INTERFACE="wg-mesh"
-      STALE_THRESHOLD=180
-
-      if ! wg show "$WG_INTERFACE" &>/dev/null; then
-          echo "[wg-watchdog] Interface not up — re-enrolling"
-          /usr/local/bin/wg-mesh-enroll.sh
-          exit 0
-      fi
-
-      LAST_HANDSHAKE=$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
-      NOW=$(date +%s)
-      AGE=$(( NOW - ${LAST_HANDSHAKE:-0} ))
-
-      if [ "${LAST_HANDSHAKE:-0}" -eq 0 ] || [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
-          echo "[wg-watchdog] Handshake stale (${AGE}s) — re-enrolling"
-          /usr/local/bin/wg-mesh-enroll.sh
-      else
-          echo "[wg-watchdog] Handshake OK (${AGE}s ago)"
-      fi
-
 runcmd:
-  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
-  - systemctl start qemu-guest-agent || true
-
   # ── DHT identity from NodeAgent obligation state ─────────────────────────
   # Fetches persistent Ed25519 keypair — same peer ID survives VM replacement.
   - |

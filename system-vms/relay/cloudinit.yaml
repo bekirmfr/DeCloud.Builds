@@ -1,46 +1,46 @@
 #cloud-config
-# DeCloud Relay VM Cloud-Init Configuration
-# This VM serves as a WireGuard relay for CGNAT nodes
-# Version: 5.1
+# DeCloud Relay VM Cloud-Init Configuration — Role Layer
+# Version: 6.0
 #
-# Changes from 5.0:
-#   - bootcmd: start qemu-guest-agent early (before packages)
-#   - nat-callback service: inject RELAY_VM_ID and HOST_MACHINE_ID via
-#     Environment= so notify-nat-ready.sh (artifact pipeline, no cloud-init
-#     substitution) can authenticate correctly against the node agent
-#   - artifact downloads: fail loudly (curl -f inside set -e block) instead
-#     of silent curl -sf; missing artifact now halts cloud-init immediately
-#   - ssh_pwauth / authorized_keys: SSH access for operators
-
-hostname: __VM_NAME__
-manage_etc_hosts: true
-
-package_update: false
-package_upgrade: false
-
-bootcmd:
-  - rm -f /etc/machine-id /var/lib/dbus/machine-id
-  - systemd-machine-id-setup
-  # Mask snapd/LXD — unused in system VMs, adds ~50s boot delay
-  - systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service lxd.service lxd-agent.service 2>/dev/null || true
-  # Start guest agent as early as possible so readiness monitor can track
-  # cloud-init progress before packages are even installed.
-  - systemctl start qemu-guest-agent 2>/dev/null || true
-
-disable_root: false
-__SSH_AUTHORIZED_KEYS_BLOCK__
-ssh_pwauth: false
+# Changes from 5.1:
+#   - Stripped base content. Now a pure role layer; composes with
+#     base-templates/base-system.yaml at template-seed time via
+#     TemplateComposer. The composed result is structurally equivalent
+#     to v5.1 of this file.
+#   - Removed (now in base-system.yaml):
+#       * scalars: hostname, manage_etc_hosts, package_update/upgrade,
+#         disable_root, ssh_pwauth, __SSH_AUTHORIZED_KEYS_BLOCK__
+#       * bootcmd entries (machine-id, snapd/LXD mask, qemu-guest-agent)
+#       * 8 of 9 packages (fail2ban stays — relay-only)
+#       * runcmd: qemu-guest-agent symlink + start
+#   - Hostname standardization: source v5.1 had `hostname: __VM_NAME__`;
+#     base has `hostname: __HOSTNAME__`. This role layer no longer
+#     declares `hostname` at all (base wins, since role is silent).
+#     Other __VM_NAME__ references (final_message, log lines, metadata JSON)
+#     stay as-is — they refer to VM identity, not hostname.
+#   - Kept (role-specific):
+#       * fail2ban package
+#       * WireGuard server config + identity files + subnet file
+#       * nginx site config (HTTP-proxy + relay-API multiplexing)
+#       * fail2ban jail config
+#       * wg-quick@wg-relay-server systemd override
+#       * 4 decloud-relay-* systemd units
+#       * relay-register-poll.sh script
+#       * relay-metadata.json
+#       * Full relay-specific runcmd: IP forwarding, UFW disable,
+#         WG config rewrite from obligation state (current sed-gymnastics
+#         preserved — P0.9 standardization will replace this), wg-quick
+#         start, route config, artifact fetch, all service enables,
+#         log echoes
+#
+# This file is NOT deployed standalone. Composed with base-system.yaml.
+#
+# Note: relay does NOT compose with base-system-mesh.yaml — relay does not
+# participate in the WireGuard mesh as a peer. It IS the mesh hub for its
+# subnet, using wg-quick@wg-relay-server (not wg-quick@wg-mesh).
 
 packages:
-  - wireguard
-  - wireguard-tools
-  - nginx-light
   - fail2ban
-  - qemu-guest-agent
-  - python3
-  - curl
-  - jq
-  - openssl
 
 write_files:
   # WireGuard configuration (includes orchestrator as peer)
@@ -387,13 +387,10 @@ write_files:
         "wireguard_public_key": "__WIREGUARD_PUBLIC_KEY__",
         "orchestrator_public_key": "__ORCHESTRATOR_PUBLIC_KEY__",
         "created_at": "__TIMESTAMP__",
-        "version": "5.1"
+        "version": "6.0"
       }
 
 runcmd:
-  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
-  - systemctl start qemu-guest-agent || true
-
   # Enable IP forwarding (required for relay functionality)
   - echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   - echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
@@ -407,6 +404,11 @@ runcmd:
   # Rewrite WireGuard config with identity from NodeAgent obligation state.
   # Ensures the relay uses its persistent keypair (not the label-baked placeholder)
   # so CGNAT nodes don't need to re-register when the relay VM is replaced.
+  #
+  # NOTE (P0.9): This sed-rewrite-from-obligation-state pattern will be replaced
+  # with the standardized identity-fetch pattern (cloud-init writes the WG key
+  # file from obligation state directly; no label-baked key, no sed rewrite).
+  # Preserved here as v5.1-equivalent behavior for the structural strip.
   - |
     GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
     for i in $(seq 1 24); do
