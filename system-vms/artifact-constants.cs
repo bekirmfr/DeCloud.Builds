@@ -13,7 +13,7 @@
 // Paste this block inside the appropriate tenant template seeder class body.
 // Replace the COMPUTE_FROM_FILE placeholders with the generated values.
 
-// Generated: 2026-05-04T15:31:38Z
+// Generated: 2026-05-04T18:42:08Z
 
 // ── Shared ────────────────────────────────────────────────────────────────
     // shared/assets/decloud-env-watcher.service  (918 bytes)
@@ -121,7 +121,7 @@
 
 
 // ── Summary ─────────────────────────────────────────────────────────────────
-// Generated: 2026-05-04T15:31:40Z
+// Generated: 2026-05-04T18:42:11Z
 // Roles discovered:
 //   shared/assets/ [prefix='<none>']: 5 files
 //   blockstore/assets/ [prefix='Blockstore']: 7 files
