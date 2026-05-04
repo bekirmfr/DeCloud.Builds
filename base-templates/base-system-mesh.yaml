@@ -151,6 +151,21 @@ runcmd:
   - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
   - systemctl start qemu-guest-agent || true
 
+  # ── Env-watcher artifacts (shared across all system VM roles) ────────────
+  # Fetched here so role runcmd can enable the timer immediately after its
+  # role-specific setup without re-fetching. mkdir -p guards the symlink
+  # target used by all three role layers.
+  - |
+    set -e
+    curl -f --max-time 30 "${ARTIFACT_URL:decloud-env-watcher}" \
+      -o /usr/local/bin/decloud-env-watcher.sh
+    chmod +x /usr/local/bin/decloud-env-watcher.sh
+    curl -f --max-time 30 "${ARTIFACT_URL:decloud-env-watcher-service}" \
+      -o /etc/systemd/system/decloud-env-watcher@.service
+    curl -f --max-time 30 "${ARTIFACT_URL:decloud-env-watcher-timer}" \
+      -o /etc/systemd/system/decloud-env-watcher@.timer
+  - mkdir -p /etc/systemd/system/timers.target.wants
+
   # NOTE: The wg-config-fetch.sh invocation lives in the role layer's runcmd,
   # because the script itself is fetched via the role's role-specific artifact
   # pipeline and isn't installed by the time base runcmd executes.
