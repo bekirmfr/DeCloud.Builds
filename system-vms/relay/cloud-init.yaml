@@ -1,6 +1,6 @@
 #cloud-config
 # DeCloud Relay VM Cloud-Init Configuration — Role Layer
-# Version: 6.1
+# Version: 6.2
 #
 # Changes from 6.0:
 #   - P0.9 identity-fetch standardization. Removed:
@@ -20,6 +20,17 @@
 #     __WIREGUARD_PUBLIC_KEY__ at cloud-init render time (option 1 from §2
 #     decision log) — documentary metadata, not source of truth. The runtime
 #     /etc/wireguard/* and /etc/decloud/relay-subnet files are authoritative.
+#
+# Changes from 6.1:
+#   - P3.1.4 environment + watcher infra. Added:
+#       * write_files: /etc/decloud-relay/variable-scopes.conf
+#         (rendered from __VARIABLE_SCOPES_BLOCK__ at orchestrator render time)
+#       * write_files: /etc/decloud-relay/environment (stub; watcher overwrites)
+#       * decloud-relay-api.service, decloud-relay-http-proxy.service:
+#         EnvironmentFile=-/etc/decloud-relay/environment (optional, Phase 4 will
+#         refactor relay-api.py to read env vars; for now baked-in values still used)
+#       * runcmd: initial environment-fetch from /api/obligations/relay/environment
+#       * runcmd: watcher artifact install + decloud-env-watcher@relay.timer enable
 #
 # Changes from 5.1:
 #   - Stripped base content. Now a pure role layer; composes with
@@ -68,6 +79,23 @@ write_files:
   # block below from the NodeAgent obligation state's authoritative values,
   # then wg-quick is started. Eliminates label-baked secrets and the format
   # fragility of base64 in cloud-init labels.
+
+  # ── Environment directory, scope file, and env stub ───────────────────────
+  # Created at render time; watcher and systemd service both read from here.
+  # /etc/decloud-relay/variable-scopes.conf — rendered from __VARIABLE_SCOPES_BLOCK__
+  #   (relay has no Dynamic variables in Phase 3, so this file contains only a
+  #    comment line; the watcher sees it, reads an empty scope map, and exits cleanly)
+  # /etc/decloud-relay/environment — stub written here so systemd's EnvironmentFile=
+  #   succeeds even before the watcher's first tick overwrites it with real content.
+  - path: /etc/decloud-relay/variable-scopes.conf
+    permissions: '0644'
+    content: |
+      __VARIABLE_SCOPES_BLOCK__
+
+  - path: /etc/decloud-relay/environment
+    permissions: '0640'
+    content: |
+      ENV_GENERATION=initial
 
   # Nginx reverse proxy configuration
   # Port 80 multiplexes two services based on Host header:
@@ -187,6 +215,10 @@ write_files:
       Type=simple
       Restart=always
       RestartSec=5
+      # EnvironmentFile is optional here (relay-api.py still reads baked-in values
+      # in Phase 3). Present so Phase 4 relay-api.py refactor can source env vars
+      # without a YAML change.
+      EnvironmentFile=-/etc/decloud-relay/environment
       WorkingDirectory=/opt/decloud-relay
       ExecStart=/usr/bin/python3 /opt/decloud-relay/relay-api.py
       StandardOutput=journal
@@ -207,6 +239,7 @@ write_files:
       Type=simple
       Restart=always
       RestartSec=5
+      EnvironmentFile=-/etc/decloud-relay/environment
       WorkingDirectory=/opt/decloud-relay
       ExecStart=/usr/bin/python3 /opt/decloud-relay/http-proxy.py
       StandardOutput=journal
@@ -361,7 +394,7 @@ write_files:
         "wireguard_public_key": "__WIREGUARD_PUBLIC_KEY__",
         "orchestrator_public_key": "__ORCHESTRATOR_PUBLIC_KEY__",
         "created_at": "__TIMESTAMP__",
-        "version": "6.1"
+        "version": "6.2"
       }
 
 runcmd:
@@ -505,6 +538,36 @@ runcmd:
       -o /opt/decloud-relay/static/dashboard.js
     echo "[artifacts] All artifacts fetched successfully"
 
+  # ── Watcher artifacts ─────────────────────────────────────────────────────
+  - |
+    set -e
+    echo "[artifacts] Fetching watcher artifacts..."
+    curl -f --max-time 30 "${ARTIFACT_URL:decloud-env-watcher}" \
+      -o /usr/local/bin/decloud-env-watcher.sh
+    chmod +x /usr/local/bin/decloud-env-watcher.sh
+    curl -f --max-time 30 "${ARTIFACT_URL:decloud-env-watcher-service}" \
+      -o /etc/systemd/system/decloud-env-watcher@.service
+    curl -f --max-time 30 "${ARTIFACT_URL:decloud-env-watcher-timer}" \
+      -o /etc/systemd/system/decloud-env-watcher@.timer
+    echo "[artifacts] ✓ watcher (script + service + timer)"
+
+  # ── Initial environment-fetch ─────────────────────────────────────────────
+  # Write a real generation hash so the watcher starts from a known baseline.
+  # For Phase 3.1 (relay has no dynamics) the endpoint returns empty values;
+  # this is present for consistency with DHT/BlockStore patterns.
+  - |
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+    mkdir -p /etc/decloud-relay
+    ENV_RESP=$(curl -sf --max-time 5 \
+        "http://${GATEWAY}:5100/api/obligations/relay/environment" 2>/dev/null || echo "")
+    if [ -n "$ENV_RESP" ]; then
+      GEN=$(echo "$ENV_RESP" | jq -r '.generation // "initial"')
+      printf 'ENV_GENERATION=%s\n' "$GEN" > /etc/decloud-relay/environment
+      echo "[env] Initial environment generation: ${GEN}"
+    else
+      echo "[env] Environment endpoint not yet reachable — keeping stub; watcher will update on first tick"
+    fi
+
   - systemctl daemon-reload
   - systemctl enable decloud-relay-nat-callback.service
   - systemctl start decloud-relay-nat-callback.service
@@ -529,6 +592,14 @@ runcmd:
 
   - systemctl enable fail2ban
   - systemctl start fail2ban
+
+  # ── Enable watcher timer ─────────────────────────────────────────────────
+  # Fires decloud-env-watcher.sh relay every 60s starting 30s after boot.
+  # Uses timers.target.wants/ symlink — consistent with the cloud-init symlink
+  # pattern used for service units elsewhere in this file.
+  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer \
+        /etc/systemd/timers.target.wants/decloud-env-watcher@relay.timer
+  - systemctl start decloud-env-watcher@relay.timer
 
   - 'echo "DeCloud relay VM bootstrap complete at $(date)" >> /var/log/decloud-relay-bootstrap.log'
   - 'echo "Relay ID: __VM_ID__" >> /var/log/decloud-relay-bootstrap.log'
