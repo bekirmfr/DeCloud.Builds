@@ -597,8 +597,9 @@ runcmd:
   # Fires decloud-env-watcher.sh relay every 60s starting 30s after boot.
   # Uses timers.target.wants/ symlink — consistent with the cloud-init symlink
   # pattern used for service units elsewhere in this file.
+  - mkdir -p /etc/systemd/system/timers.target.wants
   - ln -sf /etc/systemd/system/decloud-env-watcher@.timer \
-        /etc/systemd/timers.target.wants/decloud-env-watcher@relay.timer
+        /etc/systemd/system/timers.target.wants/decloud-env-watcher@relay.timer
   - systemctl start decloud-env-watcher@relay.timer
 
   - 'echo "DeCloud relay VM bootstrap complete at $(date)" >> /var/log/decloud-relay-bootstrap.log'
