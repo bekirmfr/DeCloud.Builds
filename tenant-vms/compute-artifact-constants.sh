@@ -3,9 +3,13 @@
 # tenant-vms/compute-artifact-constants.sh
 #
 # Auto-discovers every {role}/assets/ directory under tenant-vms/,
-# computes SHA256 + data: URI for each file, and outputs a C# file
-# containing the constants needed by GeneralVmTemplateSeeder.cs (and
-# any future per-marketplace-template seeders that include inline assets).
+# computes SHA256 + data: URI for each file, and outputs a compilable
+# C# partial-class file that extends GeneralVmTemplateSeeder with
+# inline artifact constants.
+#
+# The output file is a complete compilation unit — the script auto-copies
+# it to the Orchestrator repo's TemplateConstants/ folder if the sibling
+# repo is found. Falls back to a manual-copy instruction otherwise.
 #
 # No hardcoded role lists or prefix maps. Adding a new role to
 # tenant-vms/ automatically includes it — no script changes needed.
@@ -19,7 +23,10 @@
 #   bash compute-artifact-constants.sh
 #
 # Output:
-#   artifact-constants.cs
+#   GeneralVmTemplateSeeder.Artifacts.cs  (local, then auto-copied to Orchestrator)
+#
+# Auto-copy target (sibling repo):
+#   ../DeCloud.Orchestrator/src/Orchestrator/Services/TemplateConstants/GeneralVmTemplateSeeder.Artifacts.cs
 #
 # Naming convention  —  {RolePrefix}{FileStem}{ExtSuffix}
 #
@@ -55,7 +62,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT="${SCRIPT_DIR}/artifact-constants.cs"
+OUTPUT="${SCRIPT_DIR}/GeneralVmTemplateSeeder.Artifacts.cs"
+
+# ── Auto-copy target ─────────────────────────────────────────────────────────
+# Sibling repo layout:  source/repos/DeCloud.Builds/tenant-vms/  (this script)
+#                        source/repos/DeCloud.Orchestrator/src/Orchestrator/Services/TemplateConstants/
+# SCRIPT_DIR is DeCloud.Builds/tenant-vms → ../.. reaches the common parent.
+TARGET_DIR="${SCRIPT_DIR}/../../DeCloud.Orchestrator/src/Orchestrator/Services/TemplateConstants"
+
+# ── C# partial class coordinates ─────────────────────────────────────────────
+CS_NAMESPACE="Orchestrator.Services.Tenant"
+CS_CLASS="GeneralVmTemplateSeeder"
 
 # ── Pure functions ────────────────────────────────────────────────────────────
 
@@ -194,27 +211,24 @@ discover_roles() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-# File header
-cat > "$OUTPUT" << 'HEADER'
+# File header — complete C# compilation unit
+cat > "$OUTPUT" << HEADER
 // ============================================================
-// artifact-constants.cs  —  AUTO-GENERATED
-// Run: bash tenant-vms/compute-artifact-constants.sh
-// DO NOT EDIT MANUALLY — regenerate from source files.
+// ${CS_CLASS}.Artifacts.cs  —  AUTO-GENERATED
 //
-// Usage:
-//   1. Copy the constants for changed artifacts into GeneralVmTemplateSeeder.cs
-//      (or other tenant-side seeders).
-//   2. Bump the affected TemplateRevision constant (GeneralTemplateRevision, etc.)
-//   3. Commit to the Orchestrator repo
+// Run:  bash tenant-vms/compute-artifact-constants.sh
+//       (auto-copies to Orchestrator sibling repo)
+//
+// DO NOT EDIT MANUALLY — regenerate from source files in DeCloud.Builds.
 // ============================================================
 
-// Paste this block inside the appropriate tenant template seeder class body.
-// Replace the COMPUTE_FROM_FILE placeholders with the generated values.
+// Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
+namespace ${CS_NAMESPACE};
+
+public sealed partial class ${CS_CLASS}
+{
 HEADER
-
-echo "// Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$OUTPUT"
-echo "" >> "$OUTPUT"
 
 total_files=0
 errors=0
@@ -235,7 +249,7 @@ for role in "${ROLES[@]}"; do
 
     # Section header
     section="${prefix:-Shared}"
-    echo "// ── ${section} ────────────────────────────────────────────────────────────────" >> "$OUTPUT"
+    echo "    // ── ${section} ────────────────────────────────────────────────────────────────" >> "$OUTPUT"
 
     while IFS= read -r -d '' file; do
         filename=$(basename "$file")
@@ -260,7 +274,7 @@ for role in "${ROLES[@]}"; do
     done < <(find "$assets_dir" -maxdepth 1 -type f -print0 | sort -z)
 
     if [ "$role_file_count" -eq 0 ]; then
-        echo "// [no files found in ${role}/assets/]" >> "$OUTPUT"
+        echo "    // [no files found in ${role}/assets/]" >> "$OUTPUT"
         echo "" >> "$OUTPUT"
     fi
 
@@ -269,23 +283,24 @@ for role in "${ROLES[@]}"; do
     role_names_generated["$role"]="${role_names[*]+"${role_names[*]}"}"
 done
 
-# Summary comment in output file
+# Summary comment + closing braces
 {
 echo ""
-echo "// ── Summary ─────────────────────────────────────────────────────────────────"
-echo "// Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-echo "// Roles discovered:"
+echo "    // ── Summary ─────────────────────────────────────────────────────────────────"
+echo "    // Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo "    // Roles discovered:"
 for role in "${ROLES[@]}"; do
-    echo "//   ${role}/assets/ [prefix='${role_prefixes[$role]:-}']: ${role_counts[$role]:-0} files"
+    echo "    //   ${role}/assets/ [prefix='${role_prefixes[$role]:-}']: ${role_counts[$role]:-0} files"
 done
-echo "// Total: ${total_files} artifact constants"
-[ "$errors" -gt 0 ] && echo "// ERRORS: ${errors} files failed to process"
+echo "    // Total: ${total_files} artifact constants"
+[ "$errors" -gt 0 ] && echo "    // ERRORS: ${errors} files failed to process"
+echo "}"
 } >> "$OUTPUT"
 
 # ── Console output ────────────────────────────────────────────────────────────
 
 echo ""
-echo "✓ artifact-constants.cs written (${total_files} artifacts)"
+echo "✓ ${CS_CLASS}.Artifacts.cs written (${total_files} artifacts)"
 echo ""
 
 for role in "${ROLES[@]}"; do
@@ -307,7 +322,19 @@ if [ "$errors" -gt 0 ]; then
 fi
 
 echo "Next steps:"
-echo "  1. Open artifact-constants.cs"
-echo "  2. Copy updated constant pairs into GeneralVmTemplateSeeder.cs"
-echo "  3. Bump the affected TemplateRevision constant"
-echo "  4. Commit to the Orchestrator repo"
+echo "  1. Bump GeneralTemplateRevision in ${CS_CLASS}.cs"
+echo "  2. Commit to the Orchestrator repo"
+
+# ── Auto-copy to Orchestrator ─────────────────────────────────────────────────
+
+RESOLVED_TARGET="$(cd "$TARGET_DIR" 2>/dev/null && pwd || echo "")"
+
+if [ -n "$RESOLVED_TARGET" ]; then
+    cp -f "$OUTPUT" "${RESOLVED_TARGET}/${CS_CLASS}.Artifacts.cs"
+    echo ""
+    echo "✓ Copied to ${RESOLVED_TARGET}/${CS_CLASS}.Artifacts.cs"
+else
+    echo ""
+    echo "⚠ Orchestrator target not found: ${TARGET_DIR}"
+    echo "  Copy manually:  cp ${CS_CLASS}.Artifacts.cs <orchestrator>/src/Orchestrator/Services/TemplateConstants/"
+fi
