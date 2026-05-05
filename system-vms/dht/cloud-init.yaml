@@ -2,7 +2,24 @@
 # DeCloud DHT VM Cloud-Init Configuration — Role Layer
 # Runs a libp2p Kademlia DHT node for peer discovery,
 # key-value storage, and GossipSub event propagation.
-# Version: 8.1
+# Version: 8.2
+#
+# Changes from 8.1:
+#   - P3.2.4 cutover: switch DHT_ADVERTISE_IP and DHT_BOOTSTRAP_PEERS to
+#     watcher-managed environment file. Stripped from dht.env; new
+#     EnvironmentFile=-/etc/decloud-dht/environment on decloud-dht.service.
+#     Statics-only dht.env path remains for everything else.
+#   - Added /etc/decloud-dht/variable-scopes.conf with rendered scope policy
+#     (__VARIABLE_SCOPES_BLOCK__ — populated by P1.6 resolver at render time).
+#   - Added /etc/decloud-dht/environment stub for systemd to load before the
+#     watcher's first tick.
+#   - Added initial env-fetch runcmd (mirrors relay P3.1.4) so the env file
+#     starts with a real generation hash, not "initial".
+#   - Added watcher timer enable runcmd (mirrors relay P3.1.4 + hotfix path).
+#   - DHT_LISTEN_PORT and DHT_API_PORT switched from literal values to
+#     __DHT_LISTEN_PORT__ / __DHT_API_PORT__ placeholders; orchestrator
+#     resolves via DefaultValue (4001/5080).
+#   - dht-metadata.json version bumped 8.1 → 8.2.
 #
 # Changes from 8.0:
 #   - P0.9 identity-fetch standardization: retry ceiling extended from
@@ -33,13 +50,16 @@
 # This file is NOT deployed standalone. Composed with base-system-mesh.yaml.
 
 write_files:
+  # Statics-only env file. Dynamics (DHT_ADVERTISE_IP, DHT_BOOTSTRAP_PEERS)
+  # live in /etc/decloud-dht/environment, written by decloud-env-watcher.sh.
+  # Both files are loaded by decloud-dht.service via EnvironmentFile=
+  # directives; later directives override earlier on key collision (systemd
+  # convention) — the watcher-managed file wins for any overlapping key.
   - path: /etc/decloud-dht/dht.env
     permissions: '0644'
     content: |
-      DHT_LISTEN_PORT=4001
-      DHT_API_PORT=5080
-      DHT_ADVERTISE_IP=__DHT_ADVERTISE_IP__
-      DHT_BOOTSTRAP_PEERS=__DHT_BOOTSTRAP_PEERS__
+      DHT_LISTEN_PORT=__DHT_LISTEN_PORT__
+      DHT_API_PORT=__DHT_API_PORT__
       DHT_DATA_DIR=/var/lib/decloud-dht
       DECLOUD_NODE_ID=__NODE_ID__
       DECLOUD_VM_ID=__VM_ID__
@@ -48,6 +68,25 @@ write_files:
       HOST_MACHINE_ID=__HOST_MACHINE_ID__
       DHT_MESH_MIN_PEERS=1
       DHT_MESH_STALENESS_SEC=300
+
+  # Watcher scope policy (P3.2.4). Rendered by VariableScopesBlockResolver
+  # from template.Variables — produces 2 lines for DHT:
+  #   DHT_ADVERTISE_IP=restart
+  #   DHT_BOOTSTRAP_PEERS=noop
+  - path: /etc/decloud-dht/variable-scopes.conf
+    permissions: '0644'
+    content: |
+      __VARIABLE_SCOPES_BLOCK__
+
+  # Watcher-managed environment file. Stub here so systemd's
+  # EnvironmentFile=-/etc/decloud-dht/environment doesn't fail before the
+  # watcher's first tick (the - prefix already makes it tolerant to absence,
+  # but a populated file with a known generation marker keeps the watcher's
+  # initial diff symmetric).
+  - path: /etc/decloud-dht/environment
+    permissions: '0640'
+    content: |
+      ENV_GENERATION=initial
 
   - path: /etc/decloud/dht-metadata.json
     permissions: '0644'
@@ -62,7 +101,7 @@ write_files:
         "advertise_ip": "__WG_TUNNEL_IP__",
         "wg_tunnel_ip": "__WG_TUNNEL_IP__",
         "created_at": "__TIMESTAMP__",
-        "version": "8.1",
+        "version": "8.2",
         "connectivity": "wireguard-mesh"
       }
 
@@ -102,7 +141,11 @@ write_files:
       [Service]
       Type=simple
       User=root
+      # Two env files: statics from cloud-init render, dynamics from watcher.
+      # systemd merges in order; later directives override earlier on key
+      # collision (no overlap by design).
       EnvironmentFile=/etc/decloud-dht/dht.env
+      EnvironmentFile=-/etc/decloud-dht/environment
       ExecStart=/usr/local/bin/dht-node
       Restart=always
       RestartSec=5
@@ -236,6 +279,31 @@ runcmd:
 
   - systemctl daemon-reload
 
+  # ── Initial environment-fetch (P3.2.4) ───────────────────────────────────
+  # Write a real generation hash so the watcher starts from a known baseline.
+  # Best-effort: if the endpoint isn't reachable (NodeAgent still starting),
+  # the stub written by write_files keeps "ENV_GENERATION=initial" until the
+  # watcher's first tick succeeds.
+  - |
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+    mkdir -p /etc/decloud-dht
+    ENV_RESP=$(curl -sf --max-time 5 \
+        "http://${GATEWAY}:5100/api/obligations/dht/environment" 2>/dev/null || echo "")
+    if [ -n "$ENV_RESP" ]; then
+      GEN=$(echo "$ENV_RESP" | jq -r '.generation // "initial"')
+      DHT_ADVERTISE_IP=$(echo "$ENV_RESP" | jq -r '.values.DHT_ADVERTISE_IP // ""')
+      DHT_BOOTSTRAP_PEERS=$(echo "$ENV_RESP" | jq -r '.values.DHT_BOOTSTRAP_PEERS // ""')
+      cat > /etc/decloud-dht/environment <<EOF
+    ENV_GENERATION=${GEN}
+    DHT_ADVERTISE_IP=${DHT_ADVERTISE_IP}
+    DHT_BOOTSTRAP_PEERS=${DHT_BOOTSTRAP_PEERS}
+    EOF
+      chmod 0640 /etc/decloud-dht/environment
+      echo "[env] Initial environment generation: ${GEN}"
+    else
+      echo "[env] Environment endpoint not yet reachable — keeping stub; watcher will update on first tick"
+    fi
+
   - ln -sf /etc/nginx/sites-available/dht-proxy /etc/nginx/sites-enabled/
   - rm -f /etc/nginx/sites-enabled/default
   - nginx -t
@@ -245,6 +313,15 @@ runcmd:
   - systemctl enable decloud-dht-dashboard && systemctl start decloud-dht-dashboard
   - systemctl enable decloud-dht-bootstrap-poll && systemctl start decloud-dht-bootstrap-poll
   - systemctl enable wg-mesh-watchdog.timer && systemctl start wg-mesh-watchdog.timer
+
+  # ── Enable env-watcher timer (P3.2.4) ────────────────────────────────────
+  # Fires decloud-env-watcher.sh dht every 60s starting 30s after boot.
+  # mkdir -p guard required: timers.target.wants/ may not pre-exist on
+  # Debian 12 cloud images (P3.1.6 lesson).
+  - mkdir -p /etc/systemd/system/timers.target.wants
+  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer \
+        /etc/systemd/system/timers.target.wants/decloud-env-watcher@dht.timer
+  - systemctl start decloud-env-watcher@dht.timer
 
   - 'echo "DHT node __VM_ID__ ready at $(date) — region: __DHT_REGION__, tunnel: __WG_TUNNEL_IP__" >> /var/log/decloud-dht-bootstrap.log'
 
