@@ -598,8 +598,7 @@ runcmd:
   # Uses timers.target.wants/ symlink — consistent with the cloud-init symlink
   # pattern used for service units elsewhere in this file.
   - mkdir -p /etc/systemd/system/timers.target.wants
-  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer \
-        /etc/systemd/system/timers.target.wants/decloud-env-watcher@relay.timer
+  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer /etc/systemd/system/timers.target.wants/decloud-env-watcher@relay.timer
   - systemctl start decloud-env-watcher@relay.timer
 
   - 'echo "DeCloud relay VM bootstrap complete at $(date)" >> /var/log/decloud-relay-bootstrap.log'

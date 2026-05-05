@@ -319,9 +319,7 @@ runcmd:
   # mkdir -p guard required: timers.target.wants/ may not pre-exist on
   # Debian 12 cloud images (P3.1.6 lesson).
   - mkdir -p /etc/systemd/system/timers.target.wants
-  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer \
-        /etc/systemd/system/timers.target.wants/decloud-env-watcher@dht.timer
-  - systemctl start decloud-env-watcher@dht.timer
+  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer /etc/systemd/system/timers.target.wants/decloud-env-watcher@dht.timer  - systemctl start decloud-env-watcher@dht.timer
 
   - 'echo "DHT node __VM_ID__ ready at $(date) — region: __DHT_REGION__, tunnel: __WG_TUNNEL_IP__" >> /var/log/decloud-dht-bootstrap.log'
 
