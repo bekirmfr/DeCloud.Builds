@@ -80,7 +80,7 @@ EOF
             # tunnel IP from the same NodeAgent CgnatInfo this script reads.
             # Single authority — no parallel writes from here.
 
-            # Run WireGuard mesh enrollment
+            # Run WireGuard mesh enrollment"
             log "Running wg-mesh-enroll.sh..."
             if /usr/local/bin/wg-mesh-enroll.sh; then
                 log "✓ WireGuard mesh enrollment complete"

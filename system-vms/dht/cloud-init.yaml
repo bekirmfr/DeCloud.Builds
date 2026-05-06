@@ -2,7 +2,19 @@
 # DeCloud DHT VM Cloud-Init Configuration — Role Layer
 # Runs a libp2p Kademlia DHT node for peer discovery,
 # key-value storage, and GossipSub event propagation.
-# Version: 8.2
+# Version: 8.3
+#
+# Changes from 8.2:
+#   - Bootstrap-poll ADVERTISE_IP source fix: poll service now reads from
+#     /etc/decloud-dht/environment (watcher-owned) instead of dht.env
+#     (statics file where DHT_ADVERTISE_IP was correctly stripped in P3.2.4).
+#     decloud-dht-bootstrap-poll.service: added EnvironmentFile= for both
+#     dht.env and environment. dht-bootstrap-poll.sh: in-loop source updated.
+#   - Dashboard hardening: decloud-dht-dashboard.service gained
+#     EnvironmentFile=-/etc/decloud-dht/environment and PartOf=decloud-dht.service.
+#     Mirrors decloud-blockstore-dashboard.service which got the same fix in
+#     P3.3.4. Dashboard now sees current Dynamic values and cascades on the
+#     watcher's Restart-scope reactions.
 #
 # Changes from 8.1:
 #   - P3.2.4 cutover: switch DHT_ADVERTISE_IP and DHT_BOOTSTRAP_PEERS to
@@ -163,10 +175,12 @@ write_files:
       Description=DeCloud DHT Dashboard Server
       After=decloud-dht.service nginx.service
       Wants=decloud-dht.service nginx.service
+      PartOf=decloud-dht.service
 
       [Service]
       Type=simple
       EnvironmentFile=/etc/decloud-dht/dht.env
+      EnvironmentFile=-/etc/decloud-dht/environment
       ExecStart=/usr/bin/python3 /opt/decloud-dht/dht-dashboard.py
       Restart=always
       RestartSec=5
