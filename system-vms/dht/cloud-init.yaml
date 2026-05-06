@@ -186,6 +186,8 @@ write_files:
 
       [Service]
       Type=simple
+      EnvironmentFile=/etc/decloud-dht/dht.env
+      EnvironmentFile=-/etc/decloud-dht/environment
       ExecStart=/usr/local/bin/dht-bootstrap-poll.sh
       Restart=always
       RestartSec=15

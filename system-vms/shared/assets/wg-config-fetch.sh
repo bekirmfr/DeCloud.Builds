@@ -74,18 +74,11 @@ EOF
             chmod 600 /etc/decloud/wg-mesh.env
             log "Wrote /etc/decloud/wg-mesh.env"
 
-            # Update advertise IP in role-specific env file
-            TUNNEL_IP_BARE="${TUNNEL_IP%%/*}"
-            if [ -f /etc/decloud-blockstore/blockstore.env ]; then
-                sed -i "s|^BLOCKSTORE_ADVERTISE_IP=.*|BLOCKSTORE_ADVERTISE_IP=${TUNNEL_IP_BARE}|" \
-                    /etc/decloud-blockstore/blockstore.env
-                log "Updated BLOCKSTORE_ADVERTISE_IP → ${TUNNEL_IP_BARE}"
-            fi
-            if [ -f /etc/decloud-dht/dht.env ]; then
-                sed -i "s|^DHT_ADVERTISE_IP=.*|DHT_ADVERTISE_IP=${TUNNEL_IP_BARE}|" \
-                    /etc/decloud-dht/dht.env
-                log "Updated DHT_ADVERTISE_IP → ${TUNNEL_IP_BARE}"
-            fi
+            # NOTE: *_ADVERTISE_IP is owned by the watcher, not by this script.
+            # The watcher writes /etc/decloud-{role}/environment from
+            # /api/obligations/{role}/environment, which derives the bare
+            # tunnel IP from the same NodeAgent CgnatInfo this script reads.
+            # Single authority — no parallel writes from here.
 
             # Run WireGuard mesh enrollment
             log "Running wg-mesh-enroll.sh..."

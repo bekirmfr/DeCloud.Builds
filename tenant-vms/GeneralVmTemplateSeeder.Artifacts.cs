@@ -7,7 +7,7 @@
 // DO NOT EDIT MANUALLY — regenerate from source files in DeCloud.Builds.
 // ============================================================
 
-// Generated: 2026-05-05T16:10:26Z
+// Generated: 2026-05-06T16:43:25Z
 
 namespace Orchestrator.Services.Tenant;
 
@@ -24,7 +24,7 @@ public sealed partial class GeneralVmTemplateSeeder
 
 
     // ── Summary ─────────────────────────────────────────────────────────────────
-    // Generated: 2026-05-05T16:10:26Z
+    // Generated: 2026-05-06T16:43:25Z
     // Roles discovered:
     //   general/assets/ [prefix='General']: 2 files
     // Total: 2 artifact constants

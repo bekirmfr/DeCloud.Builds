@@ -179,8 +179,10 @@ while true; do
     fi
     INITIAL_POLL_DONE=true
 
-    # ── 4. Refresh advertise IP — wg-config-fetch may have updated it. ─
-    source /etc/decloud-blockstore/blockstore.env 2>/dev/null || true
+    # ── 4. Refresh advertise IP from watcher-owned environment file. ────
+    # BLOCKSTORE_ADVERTISE_IP is a Dynamic (Restart) variable, populated by
+    # the watcher from /api/obligations/blockstore/environment.
+    source /etc/decloud-blockstore/environment 2>/dev/null || true
     ADVERTISE_IP="${BLOCKSTORE_ADVERTISE_IP:-}"
     if ! echo "${ADVERTISE_IP}" | grep -qE '^10\.20\.'; then
         log "WARN: BLOCKSTORE_ADVERTISE_IP='${ADVERTISE_IP}' is not a WireGuard mesh IP — skipping join"

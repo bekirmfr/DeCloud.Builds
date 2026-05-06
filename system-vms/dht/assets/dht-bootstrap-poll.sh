@@ -33,7 +33,6 @@ NODE_ID="${DECLOUD_NODE_ID:-}"
 VM_ID="${DECLOUD_VM_ID:-}"
 API_PORT="${DHT_API_PORT:-5080}"
 ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
-ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
 
 # Auth token from NodeAgent obligation state — persistent across redeployments.
 # Queried live so the token is always current even after NodeAgent key rotation.
@@ -146,12 +145,13 @@ while true; do
     INITIAL_POLL_DONE=true
 
     # Guard: advertise IP must be a WireGuard mesh IP before registering.
-    # If wg-config-fetch failed silently, DHT_ADVERTISE_IP may be empty or a
-    # public IP. Registering with a wrong IP stores a bad ListenAddress in the
-    # orchestrator and gives other nodes an unreachable multiaddr (the host's
-    # CGNAT tunnel IP instead of the DHT VM's WireGuard tunnel IP).
-    # Re-source dht.env — wg-config-fetch or the watchdog may have updated it.
-    source /etc/decloud-dht/dht.env 2>/dev/null || true
+    # Registering with a wrong IP stores a bad ListenAddress in the orchestrator
+    # and gives other nodes an unreachable multiaddr (the host's CGNAT tunnel IP
+    # instead of the DHT VM's WireGuard tunnel IP).
+    # Re-source the watcher-owned environment file. DHT_ADVERTISE_IP is a
+    # Dynamic (Restart) variable populated by the watcher from
+    # /api/obligations/dht/environment.
+    source /etc/decloud-dht/environment 2>/dev/null || true
     ADVERTISE_IP="${DHT_ADVERTISE_IP:-}"
     if ! echo "${ADVERTISE_IP}" | grep -qE '^10\.20\.'; then
         log "WARN: ADVERTISE_IP='${ADVERTISE_IP}' is not a WireGuard mesh IP (10.20.x.x) — skipping join until wg-mesh assigns tunnel IP"

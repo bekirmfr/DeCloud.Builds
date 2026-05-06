@@ -197,6 +197,8 @@ write_files:
 
       [Service]
       Type=simple
+      EnvironmentFile=/etc/decloud-blockstore/blockstore.env
+      EnvironmentFile=-/etc/decloud-blockstore/environment
       ExecStart=/usr/local/bin/blockstore-bootstrap-poll.sh
       Restart=always
       RestartSec=15
