@@ -1,7 +1,19 @@
 #cloud-config
 # DeCloud Block Store VM Cloud-Init Configuration — Role Layer
 # Runs a libp2p BitSwap block store for content-addressed storage.
-# Version: 4.2
+# Version: 4.3
+#
+# Changes from 4.2:
+#   - Restored the canonical v4.1 identity-fetch block. v4.2 mistakenly
+#     introduced /api/obligations/blockstore/identity (endpoint that does
+#     not exist on the NodeAgent) and a fabricated retry-loop shape; this
+#     produced 60 silent 404 retries followed by exit 1 on every fresh
+#     deploy after the binaries/v1.1.0 cutover (the v1.0.0 binary's
+#     loadOrCreateIdentity fallback masked the latent inconsistency in
+#     prior deploys, but v1.1.0 removed that fallback per P0.9 design).
+#     Endpoint corrected to /api/obligations/blockstore/state per P0.9
+#     standardization across all three roles. Code shape re-aligned with
+#     DHT (line-for-line same retry loop).
 #
 # Changes from 4.1:
 #   - P3.3.4 cutover: switch BLOCKSTORE_ADVERTISE_IP and BLOCKSTORE_BOOTSTRAP_PEERS
@@ -201,33 +213,35 @@ runcmd:
   # identity.key at startup; no HTTP client in binary, no self-create.
   # 60 attempts × 10s = 10 min ceiling. Hard-fail on final timeout.
   #
-  # (Block kept identical to v4.1 — paste preserved here for the wholesale
-  # replacement; do not modify in this patch. Reproduced from current file.)
+  # Format: raw 32-byte Ed25519 seed (decoded from obligation state's
+  # ed25519PrivateKeyBase64). Binary expands to full 64-byte key at read time.
   - |
     GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
-    mkdir -p /var/lib/decloud-blockstore
-    chmod 0700 /var/lib/decloud-blockstore
-    SUCCESS=0
-    for attempt in $(seq 1 60); do
-      RESP=$(curl -sf --max-time 5 \
-          "http://${GATEWAY}:5100/api/obligations/blockstore/identity" 2>/dev/null || echo "")
-      if [ -n "$RESP" ]; then
-        SEED_B64=$(echo "$RESP" | jq -r '.ed25519PrivateKeyBase64 // empty')
-        if [ -n "$SEED_B64" ]; then
-          echo "$SEED_B64" | base64 -d > /var/lib/decloud-blockstore/identity.key
-          chmod 0600 /var/lib/decloud-blockstore/identity.key
-          echo "[identity] BlockStore identity fetched on attempt ${attempt}"
-          SUCCESS=1
-          break
-        fi
+    LOG="/var/log/decloud-blockstore-bootstrap.log"
+    log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] blockstore-identity: $*" | tee -a "$LOG"; }
+    log "Fetching BlockStore identity from NodeAgent obligation state..."
+    ATTEMPTS=0
+    MAX_ATTEMPTS=60
+    STATE=""
+    while [ $ATTEMPTS -lt $MAX_ATTEMPTS ] && [ -z "$STATE" ]; do
+      STATE=$(curl -sf --max-time 5 \
+          "http://${GATEWAY}:5100/api/obligations/blockstore/state" 2>/dev/null || echo "")
+      if [ -z "$STATE" ]; then
+        ATTEMPTS=$((ATTEMPTS+1))
+        log "Not ready — retrying in 10s (attempt ${ATTEMPTS}/${MAX_ATTEMPTS})"
+        sleep 10
       fi
-      echo "[identity] Attempt ${attempt}/60 — NodeAgent not ready, retrying in 10s"
-      sleep 10
     done
-    if [ "$SUCCESS" -ne 1 ]; then
-      echo "[identity] FATAL: failed to fetch BlockStore identity after 600s — aborting boot"
+    if [ -z "$STATE" ]; then
+      log "FATAL: BlockStore identity unavailable after 10 minutes — aborting cloud-init"
       exit 1
     fi
+    mkdir -p /var/lib/decloud-blockstore && chmod 700 /var/lib/decloud-blockstore
+    echo "$STATE" | jq -r '.ed25519PrivateKeyBase64' | base64 -d \
+        > /var/lib/decloud-blockstore/identity.key
+    chmod 600 /var/lib/decloud-blockstore/identity.key
+    PEER_ID=$(echo "$STATE" | jq -r '.peerId // "unknown"')
+    log "BlockStore identity loaded (peerId: ${PEER_ID})"
 
   # ── Artifact fetch (binary + scripts) ────────────────────────────────────
   # (Block kept identical to v4.1 — wholesale replacement preserves it.)
