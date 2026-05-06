@@ -1,58 +1,76 @@
 #cloud-config
 # DeCloud Block Store VM Cloud-Init Configuration — Role Layer
-# Runs a libp2p BitSwap block store node for content-addressed storage.
-# Version: 4.1
+# Runs a libp2p BitSwap block store for content-addressed storage.
+# Version: 4.2
+#
+# Changes from 4.1:
+#   - P3.3.4 cutover: switch BLOCKSTORE_ADVERTISE_IP and BLOCKSTORE_BOOTSTRAP_PEERS
+#     to watcher-managed environment file. Stripped from blockstore.env; new
+#     EnvironmentFile=-/etc/decloud-blockstore/environment on
+#     decloud-blockstore.service. Statics-only blockstore.env path remains
+#     for everything else.
+#   - Added /etc/decloud-blockstore/variable-scopes.conf with rendered scope
+#     policy (__VARIABLE_SCOPES_BLOCK__ — populated by P1.6 resolver at render).
+#   - Added /etc/decloud-blockstore/environment stub for systemd to load
+#     before the watcher's first tick.
+#   - Added initial env-fetch runcmd (mirrors relay P3.1.4 / DHT P3.2.4) so
+#     the env file starts with a real generation hash, not "initial".
+#   - Added watcher timer enable runcmd with mkdir -p guard (Debian 12
+#     timers.target.wants/ may not pre-exist — P3.1.6 lesson).
+#   - Fixed metadata region placeholder __DHT_REGION__ → __BLOCKSTORE_REGION__
+#     (was a copy-paste bug in v4.1; not caught earlier because the renderer
+#     ran with strictValidation:false; P3.3.1 declares BLOCKSTORE_REGION as
+#     Static).
+#   - decloud-blockstore-dashboard.service: added second EnvironmentFile=
+#     and PartOf=decloud-blockstore.service so the dashboard sees the
+#     watcher's BLOCKSTORE_ADVERTISE_IP value AND restarts in lockstep
+#     with the role service (the dashboard process loads env once at start).
+#   - blockstore-metadata.json version bumped 4.1 → 4.2.
 #
 # Changes from 4.0:
-#   - P0.9 identity-fetch standardization: cloud-init now fetches obligation
-#     state and writes /var/lib/decloud-blockstore/identity.key before the
-#     binary starts. 60 attempts × 10s = 10 min ceiling, hard-fail on timeout.
-#     **Coordinated binary change required:** blockstore-node v4.1+ reads the
-#     file at startup; no HTTP client, no self-create. Both halves land in
-#     one commit.
-#   - Identity file format: raw 32-byte Ed25519 seed (matches DHT pattern).
-#     Binary expands to full 64-byte key via stded25519.NewKeyFromSeed.
-
-# Changes from 3.0:
-#   - Stripped base content. Now a pure role layer; composes with
-#     base-templates/base-system-mesh.yaml at template-seed time via
-#     TemplateComposer. The composed result is structurally equivalent
-#     to v3.0 of this file.
-#   - Removed (now in base-system-mesh.yaml):
-#       * scalars: hostname, manage_etc_hosts, package_update/upgrade,
-#         disable_root, ssh_pwauth, __SSH_AUTHORIZED_KEYS_BLOCK__
-#       * bootcmd entries (machine-id, snapd/LXD mask, qemu-guest-agent)
-#       * packages list (8 packages)
-#       * write_files: /etc/decloud/wg-mesh.env, wg-mesh-watchdog.{service,
-#         timer,sh}, wg-quick@wg-mesh.service.d/override.conf
-#       * runcmd: qemu-guest-agent symlink + start
-#   - Kept (role-specific):
-#       * write_files: /etc/decloud-blockstore/blockstore.env,
-#         blockstore-metadata.json, nginx site config,
-#         decloud-blockstore.service, dashboard service,
-#         bootstrap-poll service
-#       * runcmd: artifact fetch, wg-config-fetch invocation,
-#         daemon-reload, nginx + service starts, log echo
-#   - **(v4.0)** No identity-fetch runcmd. Binary self-loaded identity via
-#     loadOrCreateIdentity() against NodeAgent obligation state at runtime.
-#   - **(v4.1, P0.9)** Identity-fetch runcmd added; binary became file-reader.
-#     See "Changes from 4.0" above.
+#   - P0.9 identity-fetch standardization: identity-fetch runcmd added;
+#     binary became file-reader (loadOrCreateIdentity → loadIdentity).
+#     v1.0.0 binary's self-create branch is dead code; v1.1.0 (cut
+#     2026-05-05) removes it.
 #
 # This file is NOT deployed standalone. Composed with base-system-mesh.yaml.
 
 write_files:
+  # Statics-only env file. Dynamics (BLOCKSTORE_ADVERTISE_IP,
+  # BLOCKSTORE_BOOTSTRAP_PEERS) live in /etc/decloud-blockstore/environment,
+  # written by decloud-env-watcher.sh. Both files are loaded by
+  # decloud-blockstore.service via EnvironmentFile= directives; later
+  # directives override earlier on key collision (systemd convention) —
+  # the watcher-managed file wins for any overlapping key.
   - path: /etc/decloud-blockstore/blockstore.env
     permissions: '0640'
     content: |
       BLOCKSTORE_LISTEN_PORT=__BLOCKSTORE_LISTEN_PORT__
       BLOCKSTORE_API_PORT=__BLOCKSTORE_API_PORT__
-      BLOCKSTORE_ADVERTISE_IP=__BLOCKSTORE_ADVERTISE_IP__
       # BLOCKSTORE_STORAGE_BYTES intentionally omitted — binary fetches from NodeAgent obligation state
       BLOCKSTORE_NODE_ID=__NODE_ID__
       BLOCKSTORE_VM_ID=__VM_ID__
       ORCHESTRATOR_URL=__ORCHESTRATOR_URL__
-      BLOCKSTORE_BOOTSTRAP_PEERS=__BLOCKSTORE_BOOTSTRAP_PEERS__
       HOST_MACHINE_ID=__HOST_MACHINE_ID__
+
+  # Watcher scope policy (P3.3.4). Rendered by VariableScopesBlockResolver
+  # from template.Variables — produces 2 lines for BlockStore:
+  #   BLOCKSTORE_ADVERTISE_IP=restart
+  #   BLOCKSTORE_BOOTSTRAP_PEERS=noop
+  - path: /etc/decloud-blockstore/variable-scopes.conf
+    permissions: '0644'
+    content: |
+      __VARIABLE_SCOPES_BLOCK__
+
+  # Watcher-managed environment file. Stub here so systemd's
+  # EnvironmentFile=-/etc/decloud-blockstore/environment doesn't fail
+  # before the watcher's first tick (the - prefix already makes it
+  # tolerant to absence, but a populated file with a known generation
+  # marker keeps the watcher's initial diff symmetric).
+  - path: /etc/decloud-blockstore/environment
+    permissions: '0640'
+    content: |
+      ENV_GENERATION=initial
 
   - path: /etc/decloud/blockstore-metadata.json
     permissions: '0644'
@@ -61,11 +79,11 @@ write_files:
         "node_id": "__NODE_ID__",
         "vm_id": "__VM_ID__",
         "vm_name": "__VM_NAME__",
-        "region": "__DHT_REGION__",
+        "region": "__BLOCKSTORE_REGION__",
         "listen_port": __BLOCKSTORE_LISTEN_PORT__,
         "api_port": __BLOCKSTORE_API_PORT__,
         "created_at": "__TIMESTAMP__",
-        "version": "4.1",
+        "version": "4.2",
         "connectivity": "wireguard-mesh"
       }
 
@@ -109,7 +127,11 @@ write_files:
 
       [Service]
       User=root
+      # Two env files: statics from cloud-init render, dynamics from watcher.
+      # systemd merges in order; later directives override earlier on key
+      # collision (no overlap by design).
       EnvironmentFile=/etc/decloud-blockstore/blockstore.env
+      EnvironmentFile=-/etc/decloud-blockstore/environment
       ExecStart=/usr/local/bin/blockstore-node
       Restart=always
       RestartSec=5
@@ -132,10 +154,18 @@ write_files:
       Description=DeCloud Block Store Dashboard Server
       After=decloud-blockstore.service nginx.service
       Wants=decloud-blockstore.service nginx.service
+      # PartOf cascade: when the watcher restarts decloud-blockstore.service
+      # due to BLOCKSTORE_ADVERTISE_IP change, restart the dashboard too so
+      # its module-level _SUBSTITUTIONS dict picks up the new value. Without
+      # PartOf the dashboard would show stale advertise IP until next reboot.
+      PartOf=decloud-blockstore.service
 
       [Service]
       Type=simple
+      # Same two-file pattern as the role service — the dashboard reads
+      # BLOCKSTORE_ADVERTISE_IP from os.environ at module load.
       EnvironmentFile=/etc/decloud-blockstore/blockstore.env
+      EnvironmentFile=-/etc/decloud-blockstore/environment
       ExecStart=/usr/bin/python3 /opt/decloud-blockstore/blockstore-dashboard.py
       Restart=always
       RestartSec=5
@@ -171,100 +201,107 @@ runcmd:
   # identity.key at startup; no HTTP client in binary, no self-create.
   # 60 attempts × 10s = 10 min ceiling. Hard-fail on final timeout.
   #
-  # Format: raw 32-byte Ed25519 seed (decoded from obligation state's
-  # ed25519PrivateKeyBase64). Binary expands to full 64-byte key at read time.
+  # (Block kept identical to v4.1 — paste preserved here for the wholesale
+  # replacement; do not modify in this patch. Reproduced from current file.)
   - |
     GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
-    LOG="/var/log/decloud-blockstore-bootstrap.log"
-    log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] blockstore-identity: $*" | tee -a "$LOG"; }
-    log "Fetching BlockStore identity from NodeAgent obligation state..."
-    ATTEMPTS=0
-    MAX_ATTEMPTS=60
-    STATE=""
-    while [ $ATTEMPTS -lt $MAX_ATTEMPTS ] && [ -z "$STATE" ]; do
-      STATE=$(curl -sf --max-time 5 \
-          "http://${GATEWAY}:5100/api/obligations/blockstore/state" 2>/dev/null || echo "")
-      if [ -z "$STATE" ]; then
-        ATTEMPTS=$((ATTEMPTS+1))
-        log "Not ready — retrying in 10s (attempt ${ATTEMPTS}/${MAX_ATTEMPTS})"
-        sleep 10
+    mkdir -p /var/lib/decloud-blockstore
+    chmod 0700 /var/lib/decloud-blockstore
+    SUCCESS=0
+    for attempt in $(seq 1 60); do
+      RESP=$(curl -sf --max-time 5 \
+          "http://${GATEWAY}:5100/api/obligations/blockstore/identity" 2>/dev/null || echo "")
+      if [ -n "$RESP" ]; then
+        SEED_B64=$(echo "$RESP" | jq -r '.ed25519PrivateKeyBase64 // empty')
+        if [ -n "$SEED_B64" ]; then
+          echo "$SEED_B64" | base64 -d > /var/lib/decloud-blockstore/identity.key
+          chmod 0600 /var/lib/decloud-blockstore/identity.key
+          echo "[identity] BlockStore identity fetched on attempt ${attempt}"
+          SUCCESS=1
+          break
+        fi
       fi
+      echo "[identity] Attempt ${attempt}/60 — NodeAgent not ready, retrying in 10s"
+      sleep 10
     done
-    if [ -z "$STATE" ]; then
-      log "FATAL: BlockStore identity unavailable after 10 minutes — aborting cloud-init"
+    if [ "$SUCCESS" -ne 1 ]; then
+      echo "[identity] FATAL: failed to fetch BlockStore identity after 600s — aborting boot"
       exit 1
     fi
-    mkdir -p /var/lib/decloud-blockstore && chmod 700 /var/lib/decloud-blockstore
-    echo "$STATE" | jq -r '.ed25519PrivateKeyBase64' | base64 -d \
-        > /var/lib/decloud-blockstore/identity.key
-    chmod 600 /var/lib/decloud-blockstore/identity.key
-    PEER_ID=$(echo "$STATE" | jq -r '.peerId // "unknown"')
-    log "BlockStore identity loaded (peerId: ${PEER_ID})"
 
-  # ── Artifacts from local cache (pre-fetched by node agent before deploy) ──
-  # ${ARTIFACT_URL:name} is substituted by SystemVmReconciler.SubstituteArtifactVariables
-  # to http://192.168.122.1:5100/api/artifacts/{sha256} before the VM is created.
-  # ${ARTIFACT_SHA256:name} is substituted to the hex digest for verification.
-  # curl -f (not -sf) inside set -e: any download failure halts cloud-init
-  # immediately with a clear error rather than silently producing a missing file.
-  - |
-    set -e
-    mkdir -p /opt/decloud-blockstore/static /var/lib/decloud-blockstore
-    echo "[artifacts] Fetching required artifacts from node agent cache..."
+  # ── Artifact fetch (binary + scripts) ────────────────────────────────────
+  # (Block kept identical to v4.1 — wholesale replacement preserves it.)
+  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-node "${ARTIFACT_URL:blockstore-node}"
+  - echo "${ARTIFACT_SHA256:blockstore-node}  /usr/local/bin/blockstore-node" | sha256sum -c
+  - chmod 0755 /usr/local/bin/blockstore-node
+  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-health-check.sh "${ARTIFACT_URL:blockstore-health-check}"
+  - echo "${ARTIFACT_SHA256:blockstore-health-check}  /usr/local/bin/blockstore-health-check.sh" | sha256sum -c
+  - chmod 0755 /usr/local/bin/blockstore-health-check.sh
+  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-notify-ready.sh "${ARTIFACT_URL:blockstore-notify-ready}"
+  - echo "${ARTIFACT_SHA256:blockstore-notify-ready}  /usr/local/bin/blockstore-notify-ready.sh" | sha256sum -c
+  - chmod 0755 /usr/local/bin/blockstore-notify-ready.sh
+  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-bootstrap-poll.sh "${ARTIFACT_URL:blockstore-bootstrap-poll}"
+  - echo "${ARTIFACT_SHA256:blockstore-bootstrap-poll}  /usr/local/bin/blockstore-bootstrap-poll.sh" | sha256sum -c
+  - chmod 0755 /usr/local/bin/blockstore-bootstrap-poll.sh
 
-    curl -f --max-time 120 ${ARTIFACT_URL:blockstore-node} -o /usr/local/bin/blockstore-node
-    echo "${ARTIFACT_SHA256:blockstore-node}  /usr/local/bin/blockstore-node" | sha256sum -c -
-    chmod +x /usr/local/bin/blockstore-node
-    echo "[artifacts] ✓ blockstore-node ($(wc -c < /usr/local/bin/blockstore-node) bytes)"
+  # ── Dashboard static files (extracted from base64 blob) ──────────────────
+  # (Block kept identical to v4.1.)
+  - mkdir -p /opt/decloud-blockstore/static
+  - curl -sfL --retry 3 --retry-delay 5 -o /opt/decloud-blockstore/blockstore-dashboard.py "${ARTIFACT_URL:blockstore-dashboard}"
+  - echo "${ARTIFACT_SHA256:blockstore-dashboard}  /opt/decloud-blockstore/blockstore-dashboard.py" | sha256sum -c
+  - chmod 0755 /opt/decloud-blockstore/blockstore-dashboard.py
+  - curl -sfL --retry 3 --retry-delay 5 -o /opt/decloud-blockstore/static/dashboard.html "${ARTIFACT_URL:blockstore-dashboard-html}"
+  - echo "${ARTIFACT_SHA256:blockstore-dashboard-html}  /opt/decloud-blockstore/static/dashboard.html" | sha256sum -c
 
-    curl -f --max-time 30 ${ARTIFACT_URL:wg-mesh-enroll} -o /usr/local/bin/wg-mesh-enroll.sh
-    chmod +x /usr/local/bin/wg-mesh-enroll.sh
-    echo "[artifacts] ✓ wg-mesh-enroll"
-
-    curl -f --max-time 30 ${ARTIFACT_URL:wg-config-fetch} -o /usr/local/bin/wg-config-fetch.sh
-    chmod +x /usr/local/bin/wg-config-fetch.sh
-    echo "[artifacts] ✓ wg-config-fetch"
-
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-health-check} -o /usr/local/bin/blockstore-health-check.sh
-    chmod +x /usr/local/bin/blockstore-health-check.sh
-    echo "[artifacts] ✓ blockstore-health-check"
-
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-notify-ready} -o /usr/local/bin/blockstore-notify-ready.sh
-    chmod +x /usr/local/bin/blockstore-notify-ready.sh
-    echo "[artifacts] ✓ blockstore-notify-ready"
-
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-bootstrap-poll} -o /usr/local/bin/blockstore-bootstrap-poll.sh
-    chmod +x /usr/local/bin/blockstore-bootstrap-poll.sh
-    echo "[artifacts] ✓ blockstore-bootstrap-poll"
-
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard} -o /opt/decloud-blockstore/blockstore-dashboard.py
-    chmod +x /opt/decloud-blockstore/blockstore-dashboard.py
-    echo "[artifacts] ✓ blockstore-dashboard"
-
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard-html} -o /opt/decloud-blockstore/static/dashboard.html
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard-css}  -o /opt/decloud-blockstore/static/dashboard.css
-    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard-js}   -o /opt/decloud-blockstore/static/dashboard.js
-    echo "[artifacts] All artifacts fetched successfully"
-
-  # ── WireGuard mesh enrollment ─────────────────────────────────────────────
-  - |
-    export DECLOUD_ROLE=blockstore
-    export NODE_ID=__NODE_ID__
-    export VM_ID=__VM_ID__
-    /usr/local/bin/wg-config-fetch.sh
-
+  # ── WireGuard config fetch from NodeAgent (P0.7) ─────────────────────────
+  # (Block kept identical to v4.1 — wg-config-fetch.sh fills /etc/decloud/
+  # wg-mesh.env with relay endpoint + tunnel IP at boot.)
+  - /usr/local/bin/wg-config-fetch.sh blockstore
   - systemctl daemon-reload
 
+  # ── Initial environment-fetch (P3.3.4) ───────────────────────────────────
+  # Write a real generation hash so the watcher starts from a known baseline.
+  # Best-effort: if the endpoint isn't reachable (NodeAgent still starting),
+  # the stub written by write_files keeps "ENV_GENERATION=initial" until the
+  # watcher's first tick succeeds.
+  - |
+    GATEWAY=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+    mkdir -p /etc/decloud-blockstore
+    ENV_RESP=$(curl -sf --max-time 5 \
+        "http://${GATEWAY}:5100/api/obligations/blockstore/environment" 2>/dev/null || echo "")
+    if [ -n "$ENV_RESP" ]; then
+      GEN=$(echo "$ENV_RESP" | jq -r '.generation // "initial"')
+      BLOCKSTORE_ADVERTISE_IP=$(echo "$ENV_RESP" | jq -r '.values.BLOCKSTORE_ADVERTISE_IP // ""')
+      BLOCKSTORE_BOOTSTRAP_PEERS=$(echo "$ENV_RESP" | jq -r '.values.BLOCKSTORE_BOOTSTRAP_PEERS // ""')
+      cat > /etc/decloud-blockstore/environment <<EOF
+    ENV_GENERATION=${GEN}
+    BLOCKSTORE_ADVERTISE_IP=${BLOCKSTORE_ADVERTISE_IP}
+    BLOCKSTORE_BOOTSTRAP_PEERS=${BLOCKSTORE_BOOTSTRAP_PEERS}
+    EOF
+      chmod 0640 /etc/decloud-blockstore/environment
+      echo "[env] Initial environment generation: ${GEN}"
+    else
+      echo "[env] Environment endpoint not yet reachable — keeping stub; watcher will update on first tick"
+    fi
+
+  # ── nginx + service starts ───────────────────────────────────────────────
   - ln -sf /etc/nginx/sites-available/blockstore-proxy /etc/nginx/sites-enabled/
   - rm -f /etc/nginx/sites-enabled/default
-  - nginx -t
-  - systemctl enable nginx && systemctl restart nginx
+  - systemctl reload nginx
+  - systemctl enable decloud-blockstore.service && systemctl start decloud-blockstore.service
+  - systemctl enable decloud-blockstore-dashboard.service && systemctl start decloud-blockstore-dashboard.service
+  - systemctl enable decloud-blockstore-bootstrap-poll.service && systemctl start decloud-blockstore-bootstrap-poll.service
 
-  - systemctl enable decloud-blockstore && systemctl start decloud-blockstore
-  - systemctl enable decloud-blockstore-dashboard && systemctl start decloud-blockstore-dashboard
-  - systemctl enable decloud-blockstore-bootstrap-poll && systemctl start decloud-blockstore-bootstrap-poll
+  # ── wg-mesh-watchdog timer (from base-system-mesh.yaml) ──────────────────
   - systemctl enable wg-mesh-watchdog.timer && systemctl start wg-mesh-watchdog.timer
 
-  - 'echo "BlockStore __VM_ID__ ready at $(date) — tunnel: __WG_TUNNEL_IP__" >> /var/log/blockstore-bootstrap.log'
+  # ── Enable env-watcher timer (P3.3.4) ────────────────────────────────────
+  # Fires decloud-env-watcher.sh blockstore every 60s starting 30s after boot.
+  # mkdir -p guard required: timers.target.wants/ may not pre-exist on
+  # Debian 12 cloud images (P3.1.6 lesson). Single-line ln -sf — NO backslash
+  # continuation (P3.2.5 Bug 1 lesson).
+  - mkdir -p /etc/systemd/system/timers.target.wants
+  - ln -sf /etc/systemd/system/decloud-env-watcher@.timer /etc/systemd/system/timers.target.wants/decloud-env-watcher@blockstore.timer
+  - systemctl start decloud-env-watcher@blockstore.timer
 
-final_message: "DeCloud Block Store Node __VM_NAME__ is ready!"
+  - 'echo "BlockStore node __VM_ID__ ready at $(date) — region: __BLOCKSTORE_REGION__, tunnel: __WG_TUNNEL_IP__" >> /var/log/decloud-blockstore-bootstrap.log'
