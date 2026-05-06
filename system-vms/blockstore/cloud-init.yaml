@@ -95,7 +95,7 @@ write_files:
         "listen_port": __BLOCKSTORE_LISTEN_PORT__,
         "api_port": __BLOCKSTORE_API_PORT__,
         "created_at": "__TIMESTAMP__",
-        "version": "4.2",
+        "version": "4.3",
         "connectivity": "wireguard-mesh"
       }
 
@@ -243,34 +243,58 @@ runcmd:
     PEER_ID=$(echo "$STATE" | jq -r '.peerId // "unknown"')
     log "BlockStore identity loaded (peerId: ${PEER_ID})"
 
-  # ── Artifact fetch (binary + scripts) ────────────────────────────────────
-  # (Block kept identical to v4.1 — wholesale replacement preserves it.)
-  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-node "${ARTIFACT_URL:blockstore-node}"
-  - echo "${ARTIFACT_SHA256:blockstore-node}  /usr/local/bin/blockstore-node" | sha256sum -c
-  - chmod 0755 /usr/local/bin/blockstore-node
-  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-health-check.sh "${ARTIFACT_URL:blockstore-health-check}"
-  - echo "${ARTIFACT_SHA256:blockstore-health-check}  /usr/local/bin/blockstore-health-check.sh" | sha256sum -c
-  - chmod 0755 /usr/local/bin/blockstore-health-check.sh
-  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-notify-ready.sh "${ARTIFACT_URL:blockstore-notify-ready}"
-  - echo "${ARTIFACT_SHA256:blockstore-notify-ready}  /usr/local/bin/blockstore-notify-ready.sh" | sha256sum -c
-  - chmod 0755 /usr/local/bin/blockstore-notify-ready.sh
-  - curl -sfL --retry 3 --retry-delay 5 -o /usr/local/bin/blockstore-bootstrap-poll.sh "${ARTIFACT_URL:blockstore-bootstrap-poll}"
-  - echo "${ARTIFACT_SHA256:blockstore-bootstrap-poll}  /usr/local/bin/blockstore-bootstrap-poll.sh" | sha256sum -c
-  - chmod 0755 /usr/local/bin/blockstore-bootstrap-poll.sh
+  # ── Artifacts from local cache (pre-fetched by node agent before deploy) ──
+  # ${ARTIFACT_URL:name} is substituted by SystemVmReconciler.SubstituteArtifactVariables
+  # to http://192.168.122.1:5100/api/artifacts/{sha256} before the VM is created.
+  # ${ARTIFACT_SHA256:name} is substituted to the hex digest for verification.
+  # curl -f (not -sf) inside set -e: any download failure halts cloud-init
+  # immediately with a clear error rather than silently producing a missing file.
+  - |
+    set -e
+    mkdir -p /opt/decloud-blockstore/static /var/lib/decloud-blockstore
+    echo "[artifacts] Fetching required artifacts from node agent cache..."
 
-  # ── Dashboard static files (extracted from base64 blob) ──────────────────
-  # (Block kept identical to v4.1.)
-  - mkdir -p /opt/decloud-blockstore/static
-  - curl -sfL --retry 3 --retry-delay 5 -o /opt/decloud-blockstore/blockstore-dashboard.py "${ARTIFACT_URL:blockstore-dashboard}"
-  - echo "${ARTIFACT_SHA256:blockstore-dashboard}  /opt/decloud-blockstore/blockstore-dashboard.py" | sha256sum -c
-  - chmod 0755 /opt/decloud-blockstore/blockstore-dashboard.py
-  - curl -sfL --retry 3 --retry-delay 5 -o /opt/decloud-blockstore/static/dashboard.html "${ARTIFACT_URL:blockstore-dashboard-html}"
-  - echo "${ARTIFACT_SHA256:blockstore-dashboard-html}  /opt/decloud-blockstore/static/dashboard.html" | sha256sum -c
+    curl -f --max-time 120 ${ARTIFACT_URL:blockstore-node} -o /usr/local/bin/blockstore-node
+    echo "${ARTIFACT_SHA256:blockstore-node}  /usr/local/bin/blockstore-node" | sha256sum -c -
+    chmod +x /usr/local/bin/blockstore-node
+    echo "[artifacts] ✓ blockstore-node ($(wc -c < /usr/local/bin/blockstore-node) bytes)"
 
-  # ── WireGuard config fetch from NodeAgent (P0.7) ─────────────────────────
-  # (Block kept identical to v4.1 — wg-config-fetch.sh fills /etc/decloud/
-  # wg-mesh.env with relay endpoint + tunnel IP at boot.)
-  - /usr/local/bin/wg-config-fetch.sh blockstore
+    curl -f --max-time 30 ${ARTIFACT_URL:wg-mesh-enroll} -o /usr/local/bin/wg-mesh-enroll.sh
+    chmod +x /usr/local/bin/wg-mesh-enroll.sh
+    echo "[artifacts] ✓ wg-mesh-enroll"
+
+    curl -f --max-time 30 ${ARTIFACT_URL:wg-config-fetch} -o /usr/local/bin/wg-config-fetch.sh
+    chmod +x /usr/local/bin/wg-config-fetch.sh
+    echo "[artifacts] ✓ wg-config-fetch"
+
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-health-check} -o /usr/local/bin/blockstore-health-check.sh
+    chmod +x /usr/local/bin/blockstore-health-check.sh
+    echo "[artifacts] ✓ blockstore-health-check"
+
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-notify-ready} -o /usr/local/bin/blockstore-notify-ready.sh
+    chmod +x /usr/local/bin/blockstore-notify-ready.sh
+    echo "[artifacts] ✓ blockstore-notify-ready"
+
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-bootstrap-poll} -o /usr/local/bin/blockstore-bootstrap-poll.sh
+    chmod +x /usr/local/bin/blockstore-bootstrap-poll.sh
+    echo "[artifacts] ✓ blockstore-bootstrap-poll"
+
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard} -o /opt/decloud-blockstore/blockstore-dashboard.py
+    chmod +x /opt/decloud-blockstore/blockstore-dashboard.py
+    echo "[artifacts] ✓ blockstore-dashboard"
+
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard-html} -o /opt/decloud-blockstore/static/dashboard.html
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard-css}  -o /opt/decloud-blockstore/static/dashboard.css
+    curl -f --max-time 30 ${ARTIFACT_URL:blockstore-dashboard-js}   -o /opt/decloud-blockstore/static/dashboard.js
+    echo "[artifacts] All artifacts fetched successfully"
+
+  # ── WireGuard mesh enrollment ─────────────────────────────────────────────
+  - |
+    export DECLOUD_ROLE=blockstore
+    export NODE_ID=__NODE_ID__
+    export VM_ID=__VM_ID__
+    /usr/local/bin/wg-config-fetch.sh
+
   - systemctl daemon-reload
 
   # ── Initial environment-fetch (P3.3.4) ───────────────────────────────────
