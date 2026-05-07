@@ -114,3 +114,13 @@ community marketplace templates:
 
 The platform stores only metadata for external artifacts (URL + SHA256) and
 inline bytes for `data:` artifacts — it never serves binary content directly.
+
+## Placeholder syntax conventions
+
+- `__VARNAME__` — substituted at orchestrator render time inside cloud-init
+  bodies (the orchestrator's CloudInitRenderer is the authority).
+- `{{VARNAME}}` — substituted at consumer render time by the serving process
+  inside the VM. Used for per-VM content in artifact files (HTML, JS, etc.)
+  that ship as content-addressed bytes through the artifact pipeline.
+
+The two layers are independent and never overlap on the same token.

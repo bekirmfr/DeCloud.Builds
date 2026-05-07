@@ -13,7 +13,7 @@ DIRECTORY = "/var/www"
 # substituted from VM_NAME at orchestrator render time, so this resolves
 # to the VM's friendly name (e.g., "bu4-2770"). Same boundary the DHT
 # dashboard's _send_file_with_substitution uses for its placeholders.
-SUBSTITUTIONS = {"__VM_NAME__": socket.gethostname()}
+SUBSTITUTIONS = {"{{VM_NAME}}": socket.gethostname()}
 
 CACHE_DURATION = {
     '.html': 300, '.css': 86400, '.js': 86400,
@@ -27,6 +27,16 @@ class CachingHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.translate_path(self.path)
+
+        # SimpleHTTPRequestHandler.translate_path returns the directory itself
+        # for requests like "/" — directory→index.html resolution happens later
+        # inside the parent's send_head(), after do_GET dispatch. We need that
+        # resolution here so directory requests hit our substitution branch
+        # instead of falling through to the parent's raw byte serve.
+        if os.path.isdir(path):
+            index_path = os.path.join(path, 'index.html')
+            if os.path.isfile(index_path):
+                path = index_path
 
         # HTML files: substitute placeholders before serving. Per-VM templating
         # belongs at the consumer (this server), not in the artifact pipeline.
