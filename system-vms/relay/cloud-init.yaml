@@ -253,7 +253,7 @@ write_files:
   # processed by cloud-init variable substitution. RELAY_VM_ID and
   # HOST_MACHINE_ID are injected here (this unit IS in write_files and
   # DOES get substitution) so the script can authenticate against the
-  # node agent without needing __PLACEHOLDER__ processing.
+  # node agent without needing double-underscore placeholder processing.
   - path: /etc/systemd/system/decloud-relay-nat-callback.service
     permissions: '0644'
     content: |
