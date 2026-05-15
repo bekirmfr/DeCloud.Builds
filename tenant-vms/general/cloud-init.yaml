@@ -40,9 +40,9 @@ runcmd:
   - curl -sf "${ARTIFACT_URL:general-index}" -o /var/www/index.html
   - chmod 644 /var/www/index.html
   # Substitute deploy-time {{...}} placeholders in the welcome page.
-  # Convention: __varname__ is render-time (cloud-init body only); {{VAR}} is
+  # Convention: __varname__ is render-time (cloud-init body only); {{VM_NAME}} is
   # deploy-time (artifacts, served content). The orchestrator's
-  # CloudInitRenderer substitutes __VM_NAME__ in the right-hand side
+  # CloudInitRenderer substitutes __varname__ in the right-hand side
   # below; sed substitutes {{VM_NAME}} in the HTML at runcmd time.
   - sed -i "s|{{VM_NAME}}|__VM_NAME__|g" /var/www/index.html
   - curl -sf "${ARTIFACT_URL:general-api}" -o /usr/local/bin/welcome-server.py
