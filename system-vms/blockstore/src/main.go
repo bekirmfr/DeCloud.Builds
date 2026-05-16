@@ -108,6 +108,13 @@ const (
 	FetchQueueSize = 2000
 )
 
+const (
+	expectedPeersFile     = "/var/lib/decloud-blockstore/expected-peers"
+	coldStartGraceSec     = 60
+	expectedPeersFreshSec = 120
+	defaultMeshMinPeers   = 1
+)
+
 // blockFetcher is the interface implemented by bitswap sessions.
 // Defined locally to avoid importing the exchange package.
 // Sessions send WANT messages to connected peers directly —
@@ -870,6 +877,28 @@ func isIPOnAnyInterface(ip string) bool {
 // ═══════════════════════════════════════════════════════════════════
 // Bootstrap peers
 // ═══════════════════════════════════════════════════════════════════
+
+// readExpectedPeers reads the expected peer count written by bootstrap-poll.sh.
+// Returns -1 (unknown) if the file is missing, unreadable, or stale.
+func readExpectedPeers() int {
+	info, err := os.Stat(expectedPeersFile)
+	if err != nil {
+		return -1
+	}
+	if time.Since(info.ModTime()).Seconds() > expectedPeersFreshSec {
+		return -1
+	}
+	data, err := os.ReadFile(expectedPeersFile)
+	if err != nil {
+		return -1
+	}
+	s := strings.TrimSpace(string(data))
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return -1
+	}
+	return n
+}
 
 func (n *BlockNode) connectBootstrapPeers(ctx context.Context) {
 	if len(n.cfg.BootstrapPeers) == 0 {
@@ -1960,6 +1989,7 @@ func (n *BlockNode) saveManifest(m *ResourceManifest) error {
 func (n *BlockNode) startHTTPServer(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", n.handleHealth)
+	mux.HandleFunc("/health/mesh", n.handleHealthMesh)
 	mux.HandleFunc("/blocks/", n.handleBlock)
 	mux.HandleFunc("/blocks", n.handleBlocks)
 	mux.HandleFunc("/stats", n.handleStats)
@@ -2029,6 +2059,64 @@ func (n *BlockNode) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"nodeId":          n.cfg.NodeID,
 		"vmId":            n.cfg.VMID,
 	})
+}
+
+// ── GET /health/mesh ────────────────────────────────────────────────────────
+// Mesh connectivity health for the reconciliation matrix.
+// 200 = healthy (has peers or isolation is expected). 503 = unhealthy.
+func (n *BlockNode) handleHealthMesh(w http.ResponseWriter, r *http.Request) {
+	uptime := time.Since(n.startTime)
+	peers := len(n.host.Network().Peers())
+
+	meshMinPeers := defaultMeshMinPeers
+	if v := os.Getenv("BS_MESH_MIN_PEERS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			meshMinPeers = parsed
+		}
+	}
+
+	expectedPeers := readExpectedPeers()
+
+	healthy := false
+	reason := ""
+
+	switch {
+	case uptime.Seconds() < coldStartGraceSec:
+		healthy = true
+		reason = "cold-start grace period"
+
+	case expectedPeers == 0:
+		healthy = true
+		reason = "no remote peers expected (single-node network)"
+
+	case expectedPeers == -1 && peers <= 1:
+		// Unknown expectation and only the local DHT sibling (or nobody).
+		// Don't punish — bootstrap-poll may still be initialising.
+		healthy = true
+		reason = "orchestrator peer expectation unknown — grace"
+
+	case peers >= meshMinPeers:
+		healthy = true
+		reason = "connected"
+
+	default:
+		reason = fmt.Sprintf("connectedPeers=%d (need >=%d)", peers, meshMinPeers)
+	}
+
+	resp := map[string]any{
+		"healthy":        healthy,
+		"connectedPeers": peers,
+		"expectedPeers":  expectedPeers,
+		"reason":         reason,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if healthy {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 // ── GET|DELETE /blocks/{cid} ─────────────────────────────────────────────────

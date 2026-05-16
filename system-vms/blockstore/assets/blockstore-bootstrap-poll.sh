@@ -50,6 +50,8 @@ fi
 POLL_INTERVAL_ISOLATED=30   # seconds between polls when no remote peers
 POLL_INTERVAL_CONNECTED=60  # seconds between polls when connected
 
+EXPECTED_PEERS_FILE="/var/lib/decloud-blockstore/expected-peers"
+
 # ═══════════════════════════════════════════════════════════════════
 # Wait for block store binary to start
 # ═══════════════════════════════════════════════════════════════════
@@ -206,6 +208,8 @@ while true; do
     if [ "$HTTP_CODE" = "200" ]; then
         CONSECUTIVE_FAILURES=0
         PEER_COUNT=$(echo "$BODY" | jq '.bootstrapPeers | length' 2>/dev/null || echo 0)
+
+        echo "$PEER_COUNT" > "$EXPECTED_PEERS_FILE" 2>/dev/null || true
 
         log "Orchestrator returned $PEER_COUNT remote bootstrap peer(s)"
 

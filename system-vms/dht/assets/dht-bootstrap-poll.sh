@@ -57,6 +57,8 @@ POLL_INTERVAL_ISOLATED=15    # seconds between polls when no peers
 POLL_INTERVAL_CONNECTED=300  # seconds between polls when connected (maintenance)
 MAX_CONNECT_FAILURES=0       # track consecutive orchestrator failures
 
+EXPECTED_PEERS_FILE="/var/lib/decloud-dht/expected-peers"
+
 log "Starting DHT bootstrap poll service"
 log "  Orchestrator: $ORCHESTRATOR_URL"
 log "  Node ID:      $NODE_ID"
@@ -177,6 +179,10 @@ while true; do
 
         # Extract bootstrap peers from response
         PEER_COUNT=$(echo "$BODY" | jq -r '.bootstrapPeers | length // 0' 2>/dev/null) || PEER_COUNT=0
+
+        # Write expected peer count so /health/mesh can distinguish
+        # "alone by design" (0 peers expected) from "isolated by failure.
+        echo "$PEER_COUNT" > "$EXPECTED_PEERS_FILE" 2>/dev/null || true
 
         if [ "$PEER_COUNT" -gt 0 ]; then
             log "Received $PEER_COUNT bootstrap peer(s) from orchestrator"

@@ -126,6 +126,15 @@ type Config struct {
 	Region         string
 }
 
+// Mesh health thresholds — tunable via cloud-init env vars.
+const (
+	defaultMeshMinPeers     = 1
+	defaultMeshStalenessSec = 300
+	expectedPeersFile       = "/var/lib/decloud-dht/expected-peers"
+	coldStartGraceSec       = 60
+	expectedPeersFreshSec   = 120 // file mtime older than this → treat as unknown
+)
+
 // NodeState tracks runtime state of the DHT node.
 type NodeState struct {
 	mu             sync.RWMutex
@@ -637,6 +646,29 @@ func retryBootstrap(ctx context.Context, h host.Host, cfg Config, state *NodeSta
 // HTTP API
 // ═══════════════════════════════════════════════════════════════════
 
+// readExpectedPeers reads the expected peer count written by bootstrap-poll.sh.
+// Returns -1 (unknown) if the file is missing, unreadable, or stale.
+func readExpectedPeers() int {
+	info, err := os.Stat(expectedPeersFile)
+	if err != nil {
+		return -1
+	}
+	// Freshness guard: if bootstrap-poll stopped writing, don't trust stale data.
+	if time.Since(info.ModTime()).Seconds() > expectedPeersFreshSec {
+		return -1
+	}
+	data, err := os.ReadFile(expectedPeersFile)
+	if err != nil {
+		return -1
+	}
+	s := strings.TrimSpace(string(data))
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
 // startAPIServer runs the HTTP health/status API.
 // Binds to 127.0.0.1 only — only localhost processes (dashboard, bootstrap-poll,
 // health checks) can reach it. External peers communicate via the libp2p TCP
@@ -661,6 +693,73 @@ func startAPIServer(port string, state *NodeState) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// ── GET /health/mesh ────────────────────────────────────────────────────
+	// Mesh connectivity health. Returns 200 when the node has adequate peers
+	// or when isolation is expected (single-node network). Returns 503 when
+	// the node should have peers but doesn't.
+	//
+	// The VmReadinessMonitor on the host probes this endpoint. Its result
+	// feeds into IsFullyReady → the reconciliation matrix's reality axis.
+	mux.HandleFunc("/health/mesh", func(w http.ResponseWriter, r *http.Request) {
+		state.mu.RLock()
+		uptime := time.Since(state.startTime)
+		peers := state.connectedPeers
+		rtSize := state.dht.RoutingTable().Size()
+		state.mu.RUnlock()
+
+		meshMinPeers := defaultMeshMinPeers
+		if v := os.Getenv("DHT_MESH_MIN_PEERS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				meshMinPeers = n
+			}
+		}
+
+		expectedPeers := readExpectedPeers()
+
+		healthy := false
+		reason := ""
+
+		switch {
+		case uptime.Seconds() < coldStartGraceSec:
+			healthy = true
+			reason = "cold-start grace period"
+
+		case expectedPeers == 0:
+			healthy = true
+			reason = "no remote peers expected (single-node network)"
+
+		case expectedPeers == -1 && peers == 0 && rtSize == 0:
+			// Haven't heard from orchestrator yet AND no peers at all.
+			// Don't punish — bootstrap-poll may still be in its first iteration.
+			healthy = true
+			reason = "orchestrator peer expectation unknown — grace"
+
+		case peers >= meshMinPeers && rtSize > 0:
+			healthy = true
+			reason = "connected"
+
+		default:
+			reason = fmt.Sprintf("connectedPeers=%d (need >=%d), routingTable=%d",
+				peers, meshMinPeers, rtSize)
+		}
+
+		resp := map[string]interface{}{
+			"healthy":        healthy,
+			"connectedPeers": peers,
+			"routingTable":   rtSize,
+			"expectedPeers":  expectedPeers,
+			"reason":         reason,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if healthy {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		json.NewEncoder(w).Encode(resp)
 	})
 
