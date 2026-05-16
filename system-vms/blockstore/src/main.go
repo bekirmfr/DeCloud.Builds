@@ -63,6 +63,10 @@ import (
 // Constants
 // ═══════════════════════════════════════════════════════════════════
 
+// Version is set at build time via -ldflags "-X main.Version=..."
+// Defaults to "dev" for local builds.
+var Version = "dev"
+
 const (
 	GossipSubTopic         = "decloud/blockstore/new-blocks"
 	GossipSubVmDelTopic    = "decloud/blockstore/vm-deleted"
@@ -1990,6 +1994,7 @@ func (n *BlockNode) saveManifest(m *ResourceManifest) error {
 
 func (n *BlockNode) startHTTPServer(ctx context.Context) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/version", n.handleVersion)
 	mux.HandleFunc("/health", n.handleHealth)
 	mux.HandleFunc("/health/mesh", n.handleHealthMesh)
 	mux.HandleFunc("/blocks/", n.handleBlock)
@@ -2025,6 +2030,12 @@ func (n *BlockNode) startHTTPServer(ctx context.Context) {
 		_ = srv.Shutdown(context.Background())
 	}()
 }
+
+// ── GET /version ──────────────────────────────────────────────────────────────
+func (n *BlockNode) handleVersion(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"version": Version})
+	}
 
 // ── GET /health ──────────────────────────────────────────────────────────────
 func (n *BlockNode) handleHealth(w http.ResponseWriter, r *http.Request) {

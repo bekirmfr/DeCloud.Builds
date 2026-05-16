@@ -39,6 +39,10 @@ const (
 	keyFileName    = "identity.key"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=..."
+// Defaults to "dev" for local builds.
+var Version = "dev"
+
 // ═══════════════════════════════════════════════════════════════════
 // Diagnostic event log — ring buffer for real-time debugging
 // ═══════════════════════════════════════════════════════════════════
@@ -677,6 +681,12 @@ func readExpectedPeers() int {
 // system VM, they already have access to the identity key and can kill the process.
 func startAPIServer(port string, state *NodeState) {
 	mux := http.NewServeMux()
+
+	// ── GET /version ──────────────────────────────────────────────────────────
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"version": Version})
+	})
 
 	// ── GET /health ──────────────────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
