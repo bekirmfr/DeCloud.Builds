@@ -63,14 +63,14 @@ class DhtDashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
 
-        if path in PROXY_PATHS or path.startswith("/providers/") or path.startswith("/proximity/"):
-            self._proxy_to_dht(path)
-        elif path == "/" or path == "/index.html":
+        # Dashboard paths served locally; everything else proxied to the Go binary.
+        # This avoids maintaining a whitelist that breaks when new API endpoints are added.
+        if path == "/" or path == "/index.html":
             self._serve_dashboard()
         elif path.startswith("/static/"):
             self._serve_static(path)
         else:
-            self._send_error(404, "Not Found")
+            self._proxy_to_dht(path)
 
     def do_POST(self):
         path = urlparse(self.path).path

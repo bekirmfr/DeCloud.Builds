@@ -67,14 +67,12 @@ class BlockStoreDashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
 
-        if path in PROXY_PATHS or path.startswith("/manifests/"):
-            self._proxy_to_blockstore(path)
-        elif path == "/" or path == "/index.html":
+        if path == "/" or path == "/index.html":
             self._serve_dashboard()
         elif path.startswith("/static/"):
             self._serve_static(path)
         else:
-            self._send_error(404, "Not Found")
+            self._proxy_to_blockstore(path)
 
     def do_POST(self):
         path = urlparse(self.path).path
