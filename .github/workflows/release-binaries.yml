@@ -251,9 +251,9 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          VERSION="${{ needs.verify-tag.outputs.version }}"
-          GIT_SHA="${{ github.sha }}"
-          TAG_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION//\//%2F}"
+          export VERSION="${{ needs.verify-tag.outputs.version }}"
+          export GIT_SHA="${{ github.sha }}"
+          export TAG_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION//\//%2F}"
 
           python3 -c "
           import hashlib, json, pathlib, datetime, os
