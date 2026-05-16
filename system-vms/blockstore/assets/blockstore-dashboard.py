@@ -14,7 +14,7 @@ import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 # ==================== Configuration ====================
 BLOCKSTORE_API_PORT = int(os.environ.get("BLOCKSTORE_API_PORT", "5090"))
@@ -156,6 +156,14 @@ class BlockStoreDashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
+        except HTTPError as e:
+            data = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(data))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
         except URLError as e:
             logger.warning("Proxy to block store API failed: %s", e)
             self._send_json(502, {"error": "Block store node unreachable", "detail": str(e)})

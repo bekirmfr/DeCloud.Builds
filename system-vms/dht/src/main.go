@@ -742,9 +742,11 @@ func startAPIServer(port string, state *NodeState) {
 			healthy = true
 			reason = "no remote peers expected (single-node network)"
 
-		case expectedPeers == -1 && peers == 0 && rtSize == 0:
-			// Haven't heard from orchestrator yet AND no peers at all.
+		case expectedPeers == -1 && rtSize == 0:
+			// Haven't heard from orchestrator yet AND routing table is empty.
 			// Don't punish — bootstrap-poll may still be in its first iteration.
+			// connectedPeers may be non-zero (blockstore connects as a libp2p
+			// peer but doesn't participate in the Kademlia routing table).
 			healthy = true
 			reason = "orchestrator peer expectation unknown — grace"
 
