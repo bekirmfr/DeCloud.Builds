@@ -323,7 +323,11 @@ jobs:
       - name: Attest provenance for all artifacts
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist/dht-node-* dist/blockstore-node-*'
+          subject-path: |
+            dist/dht-node-amd64
+            dist/dht-node-arm64
+            dist/blockstore-node-amd64
+            dist/blockstore-node-arm64
 
       - name: Build release notes
         id: notes
