@@ -402,6 +402,7 @@ type BlockNode struct {
 	// Diagnostics
 	diagLog *DiagLog
 	diag    DiagCounters
+	startTime time.Time
 
 	// Per-VM catchup state: debounced diff-check triggered on fetch completion.
 	// Key: vmId, Value: timer reset channel (send to reschedule, close to cancel).
@@ -774,6 +775,7 @@ func setup(ctx context.Context, cfg Config) (*BlockNode, error) {
 		fetchQueue:    make(chan NewBlockAnnouncement, FetchQueueSize),
 		catchupTimers: make(map[string]chan struct{}),
 		retryQueue:    make(chan cid.Cid, 500),
+		startTime:     time.Now(),
 	}, nil
 }
 
