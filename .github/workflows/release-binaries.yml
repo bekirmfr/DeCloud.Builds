@@ -1,47 +1,35 @@
-# ============================================================
-# Placement: .github/workflows/release-binaries.yml
-# ============================================================
+# .github/workflows/release-binaries.yml
 #
-# Builds and releases the DeCloud system VM binaries:
-#   dht-node-amd64, dht-node-arm64
-#   blockstore-node-amd64, blockstore-node-arm64
+# DeCloud system VM binary release pipeline.
 #
-# Trigger: push a tag of the form `binaries/vX.Y.Z`
-#   git tag binaries/v1.0.0
-#   git push origin binaries/v1.0.0
+# Trigger: pushed git tag matching binaries/v* (must be a SIGNED tag —
+#          see `verify-tag` job below).
 #
-# This tag is intentionally separate from the application release
-# tag (v*) so binary releases can be cut independently of the
-# .NET application — binaries change on Go source changes;
-# the application changes on C# source changes. Decoupled.
-#
-# Release assets (per binary, per architecture):
-#   dht-node-amd64              raw ELF binary
-#   dht-node-amd64.sha256       hex digest (64 chars + newline)
+# Outputs (attached to the GitHub Release):
+#   dht-node-amd64                     Statically-linked Go binary
 #   dht-node-arm64
-#   dht-node-arm64.sha256
 #   blockstore-node-amd64
-#   blockstore-node-amd64.sha256
 #   blockstore-node-arm64
-#   blockstore-node-arm64.sha256
+#   dht-node-{amd64,arm64}.sha256      Per-binary SHA256 sidecar (convenience)
+#   blockstore-node-{amd64,arm64}.sha256
+#   manifest.json                      All artifact SHA256 + sizes + URLs
+#   manifest.json.sig                  Cosign keyless signature (Sigstore)
+#   manifest.json.pem                  Cosign signing certificate
 #
-# NOTE on decloud-agent (tenant attestation agent):
-#   The decloud-agent binary is NOT built by this workflow at present.
-#   Source for the existing binaries is missing and not currently in-tree
-#   (see implementation plan task P0.10 — "Recover or reconstruct
-#   decloud-agent source"). For now, decloud-agent-{amd64,arm64} binaries
-#   are manually uploaded to releases produced by this workflow (matching
-#   the binaries/v* tag scheme and SHA256 + URL conventions). When P0.10
-#   completes and source lands in tenant-vms/general/src/, a
-#   build-attestation-agent job will be added here mirroring build-dht.
+# Trust model (mirrors NodeAgent release.yml):
+#   1. Signed tag verified via GitHub API before any build runs.
+#   2. Binaries built deterministically (CGO_ENABLED=0, -trimpath).
+#   3. manifest.json generated from built artifacts, signed with cosign
+#      keyless (GitHub OIDC). Certificate SAN pins to this workflow.
+#   4. Orchestrator's SystemVmTemplateSeeder verifies the cosign signature
+#      then reads SHA256 values from the trusted manifest.
+#   5. Node agent verifies SHA256 on artifact prefetch.
 #
-# The .sha256 files are what P10's TemplateSeederService reads to
-# populate VmTemplate.Artifacts[].Sha256 at seeding time.
-#
-# Asset URLs follow the GitHub Releases convention:
-#   https://github.com/{org}/{repo}/releases/download/binaries%2Fv1.0.0/dht-node-amd64
-#
-# ============================================================
+# NOTE: decloud-agent-{amd64,arm64} binaries are manually uploaded to
+#   releases produced by this workflow (see P0.10). When source lands in
+#   tenant-vms/general/src/, a build-attestation-agent job will be added.
+#   The manifest covers only CI-built artifacts; manually-uploaded files
+#   are NOT included (unsigned provenance → excluded by design).
 
 name: Release system VM binaries
 
@@ -51,15 +39,57 @@ on:
       - 'binaries/v*'
 
 permissions:
-  contents: write   # required to create releases and upload assets
+  contents: write       # create releases and upload assets
+  id-token: write       # cosign keyless OIDC
+  attestations: write   # SLSA build provenance
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ── Verify tag signature ─────────────────────────────────────────────────────
+  # Gate: refuse to build unverified tags. Same pattern as NodeAgent release.yml.
+  verify-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag signature via GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${GITHUB_REF_NAME}" \
+                          --jq '.object.sha')
+
+          verified=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" \
+                            --jq '.verification.verified')
+          reason=$(gh api   "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" \
+                            --jq '.verification.reason')
+
+          echo "Tag:      ${GITHUB_REF_NAME}"
+          echo "Tag SHA:  ${tag_sha}"
+          echo "Verified: ${verified}"
+          echo "Reason:   ${reason}"
+
+          if [ "$verified" != "true" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not verifiably signed (reason=${reason})."
+            echo "Sign with: git tag -s binaries/vX.Y.Z -m '...'"
+            exit 1
+          fi
+
   # ── Build DHT node ──────────────────────────────────────────────────────────
   build-dht:
     name: Build dht-node (${{ matrix.arch }})
+    needs: [verify-tag]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -69,7 +99,7 @@ jobs:
             runner: ubuntu-24.04
             goarch: amd64
           - arch: arm64
-            runner: ubuntu-24.04-arm   # GitHub-hosted ARM64 runner
+            runner: ubuntu-24.04-arm
             goarch: arm64
 
     defaults:
@@ -120,6 +150,7 @@ jobs:
   # ── Build BlockStore node ────────────────────────────────────────────────────
   build-blockstore:
     name: Build blockstore-node (${{ matrix.arch }})
+    needs: [verify-tag]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -181,7 +212,7 @@ jobs:
   release:
     name: Create release
     runs-on: ubuntu-24.04
-    needs: [build-dht, build-blockstore]
+    needs: [verify-tag, build-dht, build-blockstore]
 
     steps:
       - name: Checkout
@@ -216,10 +247,88 @@ jobs:
             echo "OK: dist/$f"
           done
 
+      - name: Generate manifest
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.verify-tag.outputs.version }}"
+          GIT_SHA="${{ github.sha }}"
+          TAG_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION//\//%2F}"
+
+          python3 -c "
+          import hashlib, json, pathlib, datetime, os
+
+          version = os.environ['VERSION']
+          git_sha = os.environ['GIT_SHA']
+          tag_url = os.environ['TAG_URL']
+
+          artifacts = {}
+          for p in sorted(pathlib.Path('.').iterdir()):
+              # Only include binaries, not .sha256 sidecars or manifest itself
+              if not p.is_file() or p.suffix == '.sha256' or p.name.startswith('manifest'):
+                  continue
+              h = hashlib.sha256(p.read_bytes()).hexdigest()
+              artifacts[p.name] = {
+                  'sha256': h,
+                  'size': p.stat().st_size,
+                  'url': f'{tag_url}/{p.name}',
+              }
+
+          manifest = {
+              'version': version,
+              'git_sha': git_sha,
+              'built_at': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+              'artifacts': artifacts,
+          }
+          pathlib.Path('manifest.json').write_text(
+              json.dumps(manifest, indent=2, sort_keys=True))
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          "
+
+      - name: Cross-check manifest SHA256 against sidecar files
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Every .sha256 sidecar must match the manifest entry.
+          # Catches any mismatch between the build step and manifest generation.
+          for sc in *.sha256; do
+            binary="${sc%.sha256}"
+            sidecar_hash=$(cat "$sc" | tr -d '[:space:]')
+            manifest_hash=$(python3 -c "
+          import json
+          m = json.load(open('manifest.json'))
+          print(m['artifacts']['$binary']['sha256'])
+          ")
+            if [ "$sidecar_hash" != "$manifest_hash" ]; then
+              echo "::error::SHA256 mismatch for $binary: sidecar=$sidecar_hash manifest=$manifest_hash"
+              exit 1
+            fi
+            echo "OK: $binary sha256=$sidecar_hash"
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign manifest (keyless, OIDC)
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          COSIGN_YES=true cosign sign-blob \
+            --output-signature manifest.json.sig \
+            --output-certificate manifest.json.pem \
+            manifest.json
+
+      - name: Attest provenance for all artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/dht-node-* dist/blockstore-node-*'
+
       - name: Build release notes
         id: notes
         run: |
-          VERSION="${{ github.ref_name }}"
+          VERSION="${{ needs.verify-tag.outputs.version }}"
           TAG_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION//\//%2F}"
 
           {
@@ -227,15 +336,25 @@ jobs:
             echo ""
             echo "### Asset URLs and SHA256 digests"
             echo ""
-            echo "Copy these into \`TemplateSeederService\` for P10."
+            echo "Manifest is cosign-signed. Verify with:"
             echo ""
-            echo "| Binary | Architecture | SHA256 | URL |"
-            echo "|--------|-------------|--------|-----|"
+            echo '```bash'
+            echo "cosign verify-blob \\"
+            echo "  --certificate-identity-regexp '^https://github\\.com/${{ github.repository }}/\\.github/workflows/release-binaries\\.yml@' \\"
+            echo "  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \\"
+            echo "  --signature manifest.json.sig \\"
+            echo "  --certificate manifest.json.pem \\"
+            echo "  manifest.json"
+            echo '```'
+            echo ""
+            echo "| Binary | Architecture | SHA256 | Size | URL |"
+            echo "|--------|-------------|--------|------|-----|"
             for binary in dht-node blockstore-node; do
               for arch in amd64 arm64; do
                 sha=$(cat dist/${binary}-${arch}.sha256)
+                size=$(stat -c%s dist/${binary}-${arch})
                 url="${TAG_URL}/${binary}-${arch}"
-                echo "| \`${binary}\` | \`${arch}\` | \`${sha}\` | [download](${url}) |"
+                echo "| \`${binary}\` | \`${arch}\` | \`${sha}\` | ${size} | [download](${url}) |"
               done
             done
             echo ""
@@ -276,3 +395,6 @@ jobs:
             dist/blockstore-node-amd64.sha256
             dist/blockstore-node-arm64
             dist/blockstore-node-arm64.sha256
+            dist/manifest.json
+            dist/manifest.json.sig
+            dist/manifest.json.pem
