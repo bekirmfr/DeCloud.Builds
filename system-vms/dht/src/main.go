@@ -674,6 +674,46 @@ func readExpectedPeers() int {
 	return n
 }
 
+// getSystemDiagnostics reads memory pressure and OOM kill count from /proc.
+// Included in the /health response so the VmReadinessMonitor captures it
+// in LastSuccessBody — when the VM dies, the pre-crash memory state is
+// preserved in the deleted VmRecord's ServicesJson.
+func getSystemDiagnostics() map[string]interface{} {
+	diag := map[string]interface{}{}
+
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			switch {
+			case strings.HasPrefix(line, "MemTotal:"):
+				diag["memTotalKB"] = parseMemInfoValue(line)
+			case strings.HasPrefix(line, "MemAvailable:"):
+				diag["memAvailableKB"] = parseMemInfoValue(line)
+			}
+		}
+	}
+
+	if data, err := os.ReadFile("/proc/vmstat"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "oom_kill ") {
+				var count int64
+				fmt.Sscanf(line, "oom_kill %d", &count)
+				diag["oomKills"] = count
+			}
+		}
+	}
+
+	return diag
+}
+
+func parseMemInfoValue(line string) int64 {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 {
+		val, _ := strconv.ParseInt(fields[1], 10, 64)
+		return val
+	}
+	return 0
+}
+
 // startAPIServer runs the HTTP health/status API.
 // Binds to 127.0.0.1 only — only localhost processes (dashboard, bootstrap-poll,
 // health checks) can reach it. External peers communicate via the libp2p TCP
@@ -701,6 +741,7 @@ func startAPIServer(port string, state *NodeState) {
 			"uptimeSeconds":  int(time.Since(state.startTime).Seconds()),
 			"addresses":      formatAddresses(state.host),
 			"routingTable":   state.dht.RoutingTable().Size(),
+			"system":         getSystemDiagnostics(),
 		}
 
 		w.Header().Set("Content-Type", "application/json")

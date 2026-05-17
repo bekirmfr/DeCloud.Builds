@@ -64,6 +64,7 @@ write_files:
       BLOCKSTORE_VM_ID=__VM_ID__
       ORCHESTRATOR_URL=__ORCHESTRATOR_URL__
       HOST_MACHINE_ID=__HOST_MACHINE_ID__
+      GOMEMLIMIT=400MiB
 
   # Watcher scope policy (P3.3.4). Rendered by VariableScopesBlockResolver
   # from template.Variables — produces 2 lines for BlockStore:

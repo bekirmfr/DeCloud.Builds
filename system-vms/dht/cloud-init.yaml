@@ -80,6 +80,7 @@ write_files:
       HOST_MACHINE_ID=__HOST_MACHINE_ID__
       DHT_MESH_MIN_PEERS=1
       DHT_MESH_STALENESS_SEC=300
+      GOMEMLIMIT=400MiB
 
   # Watcher scope policy (P3.2.4). Rendered by VariableScopesBlockResolver
   # from template.Variables — produces 2 lines for DHT:
