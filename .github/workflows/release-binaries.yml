@@ -24,12 +24,6 @@
 #   4. Orchestrator's SystemVmTemplateSeeder verifies the cosign signature
 #      then reads SHA256 values from the trusted manifest.
 #   5. Node agent verifies SHA256 on artifact prefetch.
-#
-# NOTE: decloud-agent-{amd64,arm64} binaries are manually uploaded to
-#   releases produced by this workflow (see P0.10). When source lands in
-#   tenant-vms/general/src/, a build-attestation-agent job will be added.
-#   The manifest covers only CI-built artifacts; manually-uploaded files
-#   are NOT included (unsigned provenance → excluded by design).
 
 name: Release system VM binaries
 
@@ -361,14 +355,6 @@ jobs:
                 echo "| \`${binary}\` | \`${arch}\` | \`${sha}\` | ${size} | [download](${url}) |"
               done
             done
-            echo ""
-            echo "### Manually-uploaded assets"
-            echo ""
-            echo "The following binaries are uploaded manually to this release"
-            echo "(see implementation plan P0.10 — source not yet reconstructed):"
-            echo ""
-            echo "- \`decloud-agent-amd64\` and \`decloud-agent-amd64.sha256\`"
-            echo "- \`decloud-agent-arm64\` and \`decloud-agent-arm64.sha256\`"
             echo ""
             echo "### What changed"
             echo ""
