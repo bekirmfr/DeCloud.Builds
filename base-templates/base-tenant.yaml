@@ -6,7 +6,6 @@
 # Provides infrastructure primitives common to ALL tenant VMs:
 #   - Universal hostname / password / SSH key handling
 #   - SSH Certificate Authority setup
-#   - DeCloud attestation agent
 #   - QEMU guest agent for orchestrator monitoring
 #
 # This file is NOT deployed standalone. It is merged with a role layer
@@ -105,49 +104,10 @@ write_files:
       ChallengeResponseAuthentication no
       UsePAM yes
 
-  # VM ID for attestation agent.
-  - path: /etc/decloud/vm-id
-    permissions: '0644'
-    content: __VM_ID__
-
-  # Orchestrator URL for health checks (read-only, no secrets).
+  # Orchestrator URL retained — read by other DeCloud tooling inside the VM.
   - path: /etc/decloud/orchestrator-url
     permissions: '0644'
     content: __ORCHESTRATOR_URL__
-
-  # Attestation agent systemd service.
-  # The binary itself is fetched in runcmd via the artifact pipeline.
-  - path: /etc/systemd/system/decloud-agent.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=DeCloud Ephemeral Attestation Agent
-      After=network.target
-      Documentation=https://docs.decloud.network/attestation
-
-      [Service]
-      Type=simple
-      ExecStart=/usr/local/bin/decloud-agent
-      Restart=always
-      RestartSec=5
-
-      # Security hardening.
-      NoNewPrivileges=yes
-      ProtectSystem=strict
-      ProtectHome=yes
-      PrivateTmp=yes
-
-      # Only needs to read /proc/* and /etc/machine-id.
-      ReadOnlyPaths=/proc /sys
-      ReadWritePaths=/var/log
-
-      # Logging.
-      StandardOutput=journal
-      StandardError=journal
-      SyslogIdentifier=decloud-agent
-
-      [Install]
-      WantedBy=multi-user.target
 
 # Runtime commands.
 runcmd:
@@ -156,14 +116,6 @@ runcmd:
   # in the role layer).
   - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
   - systemctl start qemu-guest-agent
-
-  # Fetch the attestation agent binary from the node-local artifact cache.
-  # ${ARTIFACT_URL:decloud-agent} resolves to http://192.168.122.1:5100/api/artifacts/<sha256>
-  # at render time; the architecture-correct binary is selected by the orchestrator
-  # based on the node's CPU architecture.
-  - curl -sf "${ARTIFACT_URL:decloud-agent}" -o /usr/local/bin/decloud-agent
-  - echo "${ARTIFACT_SHA256:decloud-agent}  /usr/local/bin/decloud-agent" | sha256sum -c -
-  - chmod +x /usr/local/bin/decloud-agent
 
   # Configure SSH Certificate Authority.
   - |
@@ -177,15 +129,8 @@ runcmd:
   - echo vm-__VM_ID__ > /etc/ssh/auth_principals/root
   - chmod 644 /etc/ssh/auth_principals/root
 
-  # Create decloud config directory (idempotent — write_files already created
-  # /etc/decloud as a side-effect of writing /etc/decloud/vm-id).
+  # Create decloud config directory.
   - mkdir -p /etc/decloud
-
-  # Enable and start the attestation agent.
-  - systemctl daemon-reload
-  - systemctl enable decloud-agent
-  - systemctl start decloud-agent
-  - echo "DeCloud Attestation Agent started" | systemd-cat -t decloud-agent
 
   # Reload SSH to apply CA key and principals config (SIGHUP — no port downtime).
   - systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
