@@ -271,17 +271,3 @@ runcmd:
     ║                                                               ║
     ╚═══════════════════════════════════════════════════════════════╝
     EOF
-
-final_message: |
-  AI Chatbot is starting up!
-
-  Open WebUI: https://__DECLOUD_DOMAIN__
-  Username: user / Password: __ADMIN_PASSWORD__
-
-  Default model: llama3.2:3b (pre-pulled on first boot)
-
-  Pull more models via SSH:
-    ollama pull mistral
-    ollama pull codellama
-
-  No data leaves your server. 100% private AI.
