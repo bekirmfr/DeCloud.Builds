@@ -43,6 +43,9 @@ manage_etc_hosts: true
 bootcmd:
   - rm -f /etc/machine-id /var/lib/dbus/machine-id
   - systemd-machine-id-setup
+  # Password and SSH keys always apply to root. Templates needing a non-root
+  # SSH user must create that user in their own cloud-init layer (runcmd or
+  # users: block) and set DefaultUsername to match.
   - sh -c 'P="__ADMIN_PASSWORD__"; [ -n "$P" ] && printf "%s\n" "root:$P" | chpasswd || true'
   - mkdir -p /etc/ssh/sshd_config.d
   - printf 'PasswordAuthentication yes\nPermitRootLogin yes\nChallengeResponseAuthentication no\nUsePAM yes\n' > /etc/ssh/sshd_config.d/99-decloud-password-auth.conf

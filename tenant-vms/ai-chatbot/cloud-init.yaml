@@ -1,0 +1,287 @@
+#cloud-config
+
+# DeCloud AI Chatbot (Ollama + Open WebUI) Role Layer
+#
+# Composed with base-tenant.yaml by TemplateComposer at seed time to form
+# the ai-chatbot-ollama VmTemplate.
+#
+# Platform concerns (root password, SSH password auth, sshd_config drop-in,
+# qemu-guest-agent, SSH CA, hostname, machine-id) are provided by
+# base-tenant.yaml. This file carries ONLY the Ollama + Open WebUI workload.
+#
+# This file is NOT deployed standalone.
+#
+# Substitution conventions:
+#   __VARNAME__  — orchestrator render-time, declared in
+#                  AiChatbotVmTemplateSeeder.BuildVariables() and resolved
+#                  by CloudInitRenderer Pass 1.
+#   ${VAR}       — bash runtime expansion inside heredocs / shell scripts
+#                  (NOT a render-time substitution).
+
+packages:
+  # qemu-guest-agent, curl, jq, openssl are provided by base-tenant.yaml.
+  - wget
+  - nginx
+  - apache2-utils
+
+runcmd:
+  # Install Docker (used for Open WebUI; also CPU-mode Ollama fallback).
+  - curl -fsSL https://get.docker.com | sh
+
+  # Persistent data directories — survive container recreation.
+  - mkdir -p /opt/ollama /opt/open-webui
+
+  # ── GPU Detection & Ollama Install ─────────────────────────────────────
+  # Three modes:
+  #   1. Physical NVIDIA GPU passthrough → Ollama in Docker with --gpus=all
+  #   2. DeCloud GPU proxy shims present → Ollama native with shim injection
+  #      (pinned to 0.7.0 — see GPU_PROXY_DEBUGGING_JOURNAL.md Session 16)
+  #   3. No GPU → Ollama in Docker (CPU-only)
+  - |
+    if lspci | grep -i nvidia > /dev/null 2>&1; then
+      # ── Mode 1: Physical NVIDIA GPU (passthrough / bare-metal) ──
+      echo "NVIDIA GPU detected — installing container toolkit..."
+      apt-get update
+      apt-get install -y ubuntu-drivers-common
+      ubuntu-drivers autoinstall || true
+
+      if [ ! -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg ]; then
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+          | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      fi
+      curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      apt-get update
+      apt-get install -y nvidia-container-toolkit
+      nvidia-ctk runtime configure --runtime=docker
+      systemctl restart docker
+
+      docker run -d \
+        --name ollama \
+        --restart unless-stopped \
+        --gpus=all \
+        -v /opt/ollama:/root/.ollama \
+        -p 11434:11434 \
+        ollama/ollama:latest
+
+      echo "GPU_MODE=passthrough" > /opt/ollama/gpu-status
+      echo "GPU acceleration enabled (passthrough) — Ollama in Docker"
+
+    elif [ -f /usr/local/lib/libcuda.so.1 ] && [ -f /usr/local/lib/libnvidia-ml.so.1 ]; then
+      # ── Mode 2: DeCloud GPU Proxy — Ollama native (NOT Docker) ──
+      # Our driver shim (libcuda.so.1) works natively but Ollama's internal
+      # GPU discovery can't find it inside Docker containers.
+      echo "DeCloud GPU proxy shims detected — installing Ollama natively..."
+
+      # Pin to 0.7.0 — see GPU_PROXY_DEBUGGING_JOURNAL.md Session 16 (Bug 23).
+      # Ollama 0.24.0 added ggml_backend_cuda_graph_reserve() with no fallback
+      # for cudaErrorNotSupported; the shim aborts the runner. 0.7.0 retains
+      # the graceful fallback path the shim relies on.
+      curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.7.0 sh
+
+      # ── Replace bundled NVIDIA libs with our shims (DT_NEEDED fix) ──
+      # libggml-cuda.so has DT_NEEDED entries for libcudart.so.12, libcublas.so.12,
+      # libcublasLt.so.12. The linker resolves these from the SAME DIRECTORY
+      # before LD_PRELOAD. Real cuBLAS calls cuGetExportTable (private NVIDIA
+      # internals) which cannot be proxied → crash. Replace with our shims.
+      #
+      # CRITICAL: libcublas.so.12 needs a separately-built stub with the correct
+      # @@libcublas.so.12 ELF version tags. Copying the cudart shim gives wrong
+      # tags (@@libcudart.so.12) causing silent dlopen failure of libggml-cuda.so.
+      # See: GPU_PROXY_DEBUGGING_JOURNAL.md, Problem 17 (Day 4).
+      CUDA_DIR=/usr/local/lib/ollama/cuda_v12
+      if [ -d "$CUDA_DIR" ] && [ -f /usr/local/lib/libdecloud_cuda_shim.so ]; then
+        for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+          target="$CUDA_DIR/$lib"
+          if [ -f "$target" ] && [ ! -f "$target.orig" ]; then
+            mv "$target" "$target.orig"
+            real=$(readlink -f "$target.orig" 2>/dev/null)
+            [ -n "$real" ] && [ "$real" != "$target.orig" ] && mv "$real" "$real.orig" 2>/dev/null
+          fi
+        done
+
+        cp /usr/local/lib/libdecloud_cuda_shim.so "$CUDA_DIR/libcudart.so.12"
+
+        if [ -f /usr/local/lib/libcublas_stub.so ]; then
+          cp /usr/local/lib/libcublas_stub.so "$CUDA_DIR/libcublas.so.12"
+        else
+          echo "WARNING: libcublas_stub.so not found — falling back to cuda shim copy"
+          cp /usr/local/lib/libdecloud_cuda_shim.so "$CUDA_DIR/libcublas.so.12"
+        fi
+
+        cp /usr/local/lib/libdecloud_cuda_shim.so "$CUDA_DIR/libcublasLt.so.12"
+
+        echo "Replaced bundled CUDA libs in $CUDA_DIR with GPU proxy shims"
+      fi
+
+      # ── Install NVML and libcuda shims to system library paths ──
+      # Ollama's Go code uses dlopen("libnvidia-ml.so.1") which searches
+      # system paths, not /usr/local/lib. Must be in /usr/lib/x86_64-linux-gnu/.
+      if [ -f /usr/local/lib/libnvidia-ml.so.1 ]; then
+        cp /usr/local/lib/libnvidia-ml.so.1 /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+        ln -sf libnvidia-ml.so.1 /usr/lib/x86_64-linux-gnu/libnvidia-ml.so
+      fi
+      if [ -f /usr/local/lib/libcuda.so.1 ]; then
+        cp /usr/local/lib/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so.1
+        ln -sf libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so
+      fi
+      ldconfig 2>/dev/null || true
+
+      # ── Inject GPU proxy env vars into the Ollama systemd service ──
+      mkdir -p /etc/systemd/system/ollama.service.d
+      GPCONF=/etc/systemd/system/ollama.service.d/gpu-proxy.conf
+      printf '[Service]\n' > "$GPCONF"
+      printf 'Environment="LD_LIBRARY_PATH=/usr/local/lib"\n' >> "$GPCONF"
+      printf 'Environment="LD_PRELOAD=/usr/local/lib/libdecloud_cuda_shim.so"\n' >> "$GPCONF"
+      printf 'Environment="OLLAMA_HOST=0.0.0.0:11434"\n' >> "$GPCONF"
+      printf 'Environment="OLLAMA_LLM_LIBRARY=cuda_v12"\n' >> "$GPCONF"
+      printf 'Environment="OLLAMA_FLASH_ATTENTION=0"\n' >> "$GPCONF"
+      printf 'Environment="OLLAMA_KEEP_ALIVE=-1"\n' >> "$GPCONF"
+      printf 'Environment="OLLAMA_NUM_PARALLEL=1"\n' >> "$GPCONF"
+      printf 'Environment="OLLAMA_MAX_LOADED_MODELS=1"\n' >> "$GPCONF"
+      printf 'Environment="GGML_CUDA_FORCE_MMQ=1"\n' >> "$GPCONF"
+      printf 'Environment="GGML_CUDA_DISABLE_GRAPHS=1"\n' >> "$GPCONF"
+      printf 'Environment="GGML_CUDA_NO_PEER_COPY=1"\n' >> "$GPCONF"
+
+      if [ -f /etc/decloud/gpu-proxy.env ]; then
+        grep -v '^\s*$' /etc/decloud/gpu-proxy.env | grep -v '^\s*#' | grep -v '^LD_PRELOAD=' | sed 's/^[[:space:]]*//' | while IFS= read -r envline; do
+          printf 'Environment="%s"\n' "$envline" >> "$GPCONF"
+        done
+      fi
+
+      systemctl daemon-reload
+      systemctl enable ollama
+      systemctl restart ollama
+
+      echo "GPU_MODE=proxied" > /opt/ollama/gpu-status
+      echo "GPU proxy mode enabled — Ollama native with shims"
+
+    else
+      # ── Mode 3: No GPU — Ollama in Docker (CPU-only) ──
+      echo "No GPU detected — running Ollama in Docker (CPU-only)"
+
+      docker run -d \
+        --name ollama \
+        --restart unless-stopped \
+        -v /opt/ollama:/root/.ollama \
+        -p 11434:11434 \
+        ollama/ollama:latest
+
+      echo "GPU_MODE=false" > /opt/ollama/gpu-status
+    fi
+
+    # Wait for Ollama API to be ready (native or Docker)
+    echo "Waiting for Ollama to start..."
+    for i in $(seq 1 60); do
+      if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+        echo "Ollama is ready!"
+        break
+      fi
+      sleep 2
+    done
+
+    # Pull default model (works for both native and Docker)
+    echo "Pulling llama3.2:3b model (this takes 2-5 minutes)..."
+    export HOME=/root
+    if command -v ollama > /dev/null 2>&1; then
+      ollama pull llama3.2:3b
+    elif docker ps --format '{{.Names}}' | grep -q ollama; then
+      docker exec ollama ollama pull llama3.2:3b
+    fi
+
+  # ── Start Open WebUI container ─────────────────────────────────────────
+  # WEBUI_SECRET_KEY uses __ADMIN_PASSWORD__ — substituted by the orchestrator
+  # at render time. Same value as the root password, generated per-deploy.
+  - |
+    docker run -d \
+      --name open-webui \
+      --restart unless-stopped \
+      --add-host=host.docker.internal:host-gateway \
+      -v /opt/open-webui:/app/backend/data \
+      -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+      -e WEBUI_AUTH=true \
+      -e WEBUI_SECRET_KEY=__ADMIN_PASSWORD__ \
+      -e ENABLE_SIGNUP=true \
+      -e DEFAULT_MODELS=llama3.2:3b \
+      -e ENABLE_COMMUNITY_SHARING=false \
+      -p 3000:8080 \
+      ghcr.io/open-webui/open-webui:latest
+
+  # ── Nginx reverse proxy ────────────────────────────────────────────────
+  - |
+    cat > /etc/nginx/sites-available/ai-chatbot <<'EOFNGINX'
+
+    server {
+        listen 8080;
+        server_name _;
+        client_max_body_size 100M;
+
+        location /health {
+            proxy_pass http://127.0.0.1:3000/health;
+        }
+
+        location / {
+            proxy_pass http://127.0.0.1:3000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_buffering off;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+        }
+    }
+    EOFNGINX
+
+  - rm -f /etc/nginx/sites-enabled/default
+  - ln -sf /etc/nginx/sites-available/ai-chatbot /etc/nginx/sites-enabled/ai-chatbot
+  - nginx -t && systemctl restart nginx
+  - systemctl enable nginx
+
+  # ── Welcome message ────────────────────────────────────────────────────
+  # __DECLOUD_DOMAIN__ and __ADMIN_PASSWORD__ are substituted at render time.
+  - |
+    cat > /etc/motd <<'EOF'
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║    AI Chatbot (Ollama + Open WebUI) - DeCloud Template        ║
+    ╠═══════════════════════════════════════════════════════════════╣
+    ║                                                               ║
+    ║  Chat UI:  https://__DECLOUD_DOMAIN__                         ║
+    ║  Web UI:   Sign up on first visit (you become admin)          ║
+    ║                                                               ║
+    ║  SSH:      root / __ADMIN_PASSWORD__                          ║
+    ║                                                               ║
+    ║  Default Model: llama3.2:3b                                   ║
+    ║                                                               ║
+    ║  Pull more models:                                            ║
+    ║    ollama pull mistral                                        ║
+    ║    ollama pull codellama                                      ║
+    ║    ollama pull gemma2:9b                                      ║
+    ║                                                               ║
+    ║  Services:                                                    ║
+    ║    systemctl status ollama    (Ollama service)                ║
+    ║    journalctl -u ollama -f    (Ollama logs)                   ║
+    ║    docker logs -f open-webui  (Open WebUI logs)               ║
+    ║                                                               ║
+    ║  100% Private — no data leaves this server.                   ║
+    ║                                                               ║
+    ╚═══════════════════════════════════════════════════════════════╝
+    EOF
+
+final_message: |
+  AI Chatbot is starting up!
+
+  Open WebUI: https://__DECLOUD_DOMAIN__
+  Username: user / Password: __ADMIN_PASSWORD__
+
+  Default model: llama3.2:3b (pre-pulled on first boot)
+
+  Pull more models via SSH:
+    ollama pull mistral
+    ollama pull codellama
+
+  No data leaves your server. 100% private AI.
