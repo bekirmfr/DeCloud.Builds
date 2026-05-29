@@ -1530,6 +1530,13 @@ func (n *BlockNode) sessionForPeer(ctx context.Context, p peer.ID) blockFetcher 
 	return s
 }
 
+// liveAnnounceSem bounds concurrent write-path Provide calls. A full-overlay seed
+// pushes hundreds of blocks near-simultaneously; an unbounded Provide goroutine per
+// block saturates the kad-dht query layer so every walk exhausts its deadline (the
+// "context deadline exceeded" announce storm). Overflow is NOT lost — the periodic
+// reannounce republishes any block whose live announce slot was unavailable.
+var liveAnnounceSem = make(chan struct{}, 8)
+
 // dhtProvide announces CID c to the DHT with retry backoff.
 // Retries handle the race between blockstore and DHT VM startup after
 // a NodeAgent restart — the DHT routing table may be empty for the
@@ -1909,8 +1916,34 @@ func (n *BlockNode) startRetryLoop(ctx context.Context) {
 // routing table has time to populate before Provide() calls are issued.
 // Handles: binary restart, DHT VM redeployment, 24h record expiry.
 func (n *BlockNode) reannounceExistingBlocks(ctx context.Context) {
-	time.Sleep(15 * time.Second) // wait for Kademlia routing table to populate
+	// Warmup so the Kademlia routing table is populated before the first pass.
+	select {
+	case <-time.After(15 * time.Second):
+	case <-ctx.Done():
+		return
+	}
 
+	// Periodic healer. Republishes provider records that (a) lost their live
+	// write-path announce to a seed-burst deferral, (b) failed dhtProvide's retries,
+	// (c) expired (~24h DHT record TTL), or (d) were never seen by a peer that
+	// rejoined after the original broadcast. One pass now, then every interval.
+	const ReannounceInterval = 10 * time.Minute
+	ticker := time.NewTicker(ReannounceInterval)
+	defer ticker.Stop()
+
+	for {
+		n.reannouncePass(ctx)
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// reannouncePass republishes DHT provider records for every locally stored block,
+// using a bounded worker pool so a full walk never becomes a Provide storm.
+func (n *BlockNode) reannouncePass(ctx context.Context) {
 	ch, err := n.bstore.AllKeysChan(ctx)
 	if err != nil {
 		log.Printf("reannounce: failed to list blocks: %v", err)
@@ -2286,29 +2319,41 @@ func (n *BlockNode) handleBlocks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Announce to DHT (with diagnostics tracking).
-	// dhtProvide retries with backoff — 60s context covers 3 attempts.
-	go func(c cid.Cid) {
-		announceCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		announceErr := n.dhtProvide(announceCtx, c)
-		n.mu.Lock()
-		if announceErr != nil {
-			n.diag.DHTAnnounceFail++
-			n.diagLog.Add("dht_announce_fail", map[string]interface{}{
-				"cid":   cidShort(c.String()),
-				"error": announceErr.Error(),
-				"role":  "http_write",
-			})
-		} else {
-			n.diag.DHTAnnounceSuccess++
-			n.diag.LastAnnounceAt = time.Now()
-			n.diagLog.Add("dht_announce", map[string]interface{}{
-				"cid":  cidShort(c.String()),
-				"role": "http_write",
-			})
-		}
-		n.mu.Unlock()
-	}(c)
+	// Bounded live announce. Acquire a slot or defer to the periodic reannouncer —
+	// under a seed burst the first liveAnnounceSem blocks announce live and the rest
+	// are healed by reannouncePass, instead of spawning a Provide storm that deadlines
+	// en masse and permanently drops provider records. dhtProvide retries with backoff.
+	select {
+	case liveAnnounceSem <- struct{}{}:
+		go func(c cid.Cid) {
+			defer func() { <-liveAnnounceSem }()
+			announceCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			announceErr := n.dhtProvide(announceCtx, c)
+			n.mu.Lock()
+			if announceErr != nil {
+				n.diag.DHTAnnounceFail++
+				n.diagLog.Add("dht_announce_fail", map[string]interface{}{
+					"cid":   cidShort(c.String()),
+					"error": announceErr.Error(),
+					"role":  "http_write",
+				})
+			} else {
+				n.diag.DHTAnnounceSuccess++
+				n.diag.LastAnnounceAt = time.Now()
+				n.diagLog.Add("dht_announce", map[string]interface{}{
+					"cid":  cidShort(c.String()),
+					"role": "http_write",
+				})
+			}
+			n.mu.Unlock()
+		}(c)
+	default:
+		n.diagLog.Add("dht_announce_deferred", map[string]interface{}{
+			"cid":  cidShort(c.String()),
+			"role": "http_write",
+		})
+	}
 
 	// Broadcast via GossipSub (with diagnostics tracking inside publishNewBlock)
 	manifestVersion := 0
