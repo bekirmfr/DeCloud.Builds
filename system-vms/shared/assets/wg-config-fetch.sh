@@ -54,6 +54,7 @@ while [ "$elapsed" -lt "$MAX_WAIT" ]; do
         RELAY_PUBKEY=$(jq   -r '.relayPublicKey // empty' /tmp/wg-config-response.json 2>/dev/null)
         RELAY_API=$(jq      -r '.relayApiUrl    // empty' /tmp/wg-config-response.json 2>/dev/null)
         TUNNEL_IP=$(jq      -r '.tunnelIp       // empty' /tmp/wg-config-response.json 2>/dev/null)
+        WG_MTU=$(jq         -r '.mtu            // empty' /tmp/wg-config-response.json 2>/dev/null)
 
         if [ -n "$RELAY_ENDPOINT" ] && [ -n "$RELAY_PUBKEY" ] && [ -n "$TUNNEL_IP" ]; then
             log "✓ Got WG config: endpoint=${RELAY_ENDPOINT}, tunnel=${TUNNEL_IP}"
@@ -65,6 +66,7 @@ WG_RELAY_ENDPOINT=${RELAY_ENDPOINT}
 WG_RELAY_PUBKEY=${RELAY_PUBKEY}
 WG_TUNNEL_IP=${TUNNEL_IP}
 WG_RELAY_API=${RELAY_API:-}
+WG_MTU=${WG_MTU:-}
 WG_INTERFACE=wg-mesh
 WG_PEER_TYPE=system-vm
 WG_PARENT_NODE_ID=${NODE_ID}

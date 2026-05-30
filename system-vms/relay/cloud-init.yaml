@@ -466,6 +466,7 @@ runcmd:
     Address = 10.20.${SUBNET_OCTET}.254/24
     PrivateKey = ${WG_PRIV}
     ListenPort = 51820
+    MTU = 1220
 
     PostUp = iptables -A FORWARD -i wg-relay-server -j ACCEPT
     PostUp = iptables -A FORWARD -o wg-relay-server -j ACCEPT

@@ -134,6 +134,7 @@ cat > "/etc/wireguard/${WG_INTERFACE}.conf" <<EOF
 [Interface]
 PrivateKey = ${PRIVATE_KEY}
 Address = ${WG_TUNNEL_IP}
+MTU = ${WG_MTU:-1220}
 
 [Peer]
 PublicKey = ${WG_RELAY_PUBKEY}
