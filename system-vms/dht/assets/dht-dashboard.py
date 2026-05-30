@@ -12,7 +12,7 @@ import os
 import sys
 import logging
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
@@ -199,8 +199,14 @@ def main():
     if not os.path.isdir(STATIC_DIR):
         logger.warning("Static directory missing: %s", STATIC_DIR)
 
-    server = HTTPServer(("0.0.0.0", LISTEN_PORT), DhtDashboardHandler)
-    logger.info("DHT Dashboard server listening on :%d", LISTEN_PORT)
+    # ThreadingHTTPServer: serve each request in its own thread so concurrent
+    # /providers/{cid} proxy calls from the orchestrator audit run in parallel
+    # instead of serialised. Each handler blocks up to ~30s on the DHT FindProviders
+    # walk; a single-threaded server would funnel the audit's bounded worker pool
+    # back down to one walk at a time. Concurrency is already capped upstream by the
+    # audit pool (MaxConcurrentProviderChecks), so thread-per-request needs no cap here.
+    server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), DhtDashboardHandler)
+    logger.info("DHT Dashboard server listening on :%d (threaded)", LISTEN_PORT)
     logger.info("  Proxying API to DHT binary on :%d", DHT_API_PORT)
     logger.info("  Proxied paths: %s + /providers/*", ", ".join(sorted(PROXY_PATHS)))
     logger.info("  Serving static files from %s", STATIC_DIR)
