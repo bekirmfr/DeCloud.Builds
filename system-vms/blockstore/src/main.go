@@ -68,9 +68,10 @@ import (
 var Version = "dev"
 
 const (
-	GossipSubTopic         = "decloud/blockstore/new-blocks"
-	GossipSubVmDelTopic    = "decloud/blockstore/vm-deleted"
-	GossipSubPresenceTopic = "decloud/blockstore/presence"
+	GossipSubTopic             = "decloud/blockstore/new-blocks"
+	GossipSubVmDelTopic        = "decloud/blockstore/vm-deleted"
+	GossipSubPresenceTopic     = "decloud/blockstore/presence"
+	GossipSubNeedsReplicaTopic = "decloud/blockstore/needs-replica"
 	IdentityKeyFile     = "identity.key"
 	PeerIDFile          = "peer-id"
 	BlocksSubdir        = "blocks"
@@ -423,6 +424,17 @@ type BlockNode struct {
 	// full overlay bursts. Per-CID attempt count capped at 3 via retryAttempts.
 	retryQueue    chan cid.Cid
 	retryAttempts sync.Map // string(cid) → int
+
+	// Needs-replica topic — published by runGC before each eviction so other peers
+	// holding the block can re-announce. Held on the struct so publishNeedsReplica
+	// (called from runGC, not a goroutine) can publish without re-joining.
+	needsReplicaTopic *pubsub.Topic
+
+	// needsReplicaCooldown — per-CID last-response timestamp (CID string → time.Time)
+	// to prevent thundering herd: when many peers observe the same eviction signal,
+	// only those whose cooldown has expired re-publish. Bounded in practice by total
+	// unique CIDs ever signaled; periodic cleanup is a Phase C concern.
+	needsReplicaCooldown sync.Map
 }
 
 // ── Debounced per-VM catchup ─────────────────────────────────────────────────
@@ -711,6 +723,12 @@ func main() {
 	}
 	node.startPresenceTopic(ctx)
 	go node.startVmDeletedSubscription(ctx)
+	// Join needs-replica synchronously (Phase B) so the topic is registered
+	// before startGCLoop fires its first cycle — otherwise the first eviction
+	// burst would publish to a nil topic and silently drop its signals.
+	if err := node.startNeedsReplicaSubscription(ctx); err != nil {
+		log.Printf("Warning: needs-replica subscription failed: %v", err)
+	}
 	node.startHTTPServer(ctx)
 	go node.startGCLoop(ctx)
 	for i := 0; i < GossipSubFetchWorkers; i++ {
@@ -1423,6 +1441,157 @@ func (n *BlockNode) deleteOwnerBlocks(ctx context.Context, vmId string) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Needs-replica GossipSub topic (Phase B self-healing)
+// ═══════════════════════════════════════════════════════════════════
+
+// NeedsReplicaResponseCooldown bounds how often a single peer responds to
+// repeated needs-replica announcements for the same CID. 60s is well below
+// the 10-minute periodic reannouncePass, so cooldown doesn't suppress
+// genuine TTL refresh — only redundant reactive re-publishes within a single
+// eviction cascade.
+const NeedsReplicaResponseCooldown = 60 * time.Second
+
+// NeedsReplicaAnnouncement signals that the publisher is about to evict (or
+// just lost) a local replica of a block belonging to a tenant VM. Recipients
+// that hold the same CID re-publish on the new-blocks topic so XOR-close peers
+// can absorb the missing replica. Wire-compatible idempotency: receivers
+// check bstore.Has(cid) and a per-CID cooldown before acting, so duplicate or
+// echo announcements are harmless.
+type NeedsReplicaAnnouncement struct {
+	CID          string `json:"cid"`
+	VMId         string `json:"vmId,omitempty"`         // best-effort owner context (may be empty if publisher couldn't determine)
+	Reason       string `json:"reason,omitempty"`       // "lru_evict" | "confirmed_evict" | "survey" (Phase C) | "presence_loss" (Phase C)
+	SourcePeerID string `json:"sourcePeerId,omitempty"` // publisher's libp2p peer ID — used to skip our own echoes
+	Timestamp    string `json:"timestamp"`              // RFC3339
+}
+
+// publishNeedsReplica broadcasts a needs-replica announcement. Best-effort:
+// silent no-op if the topic isn't joined yet (startup race) or if marshal/
+// publish fails. Idempotent on the wire — receivers' bstore.Has + cooldown
+// guards make duplicate publishes harmless.
+func (n *BlockNode) publishNeedsReplica(cidStr, vmId, reason string) {
+	topic := n.needsReplicaTopic
+	if topic == nil {
+		return // startup race — GC fired before subscription joined; next eviction will signal
+	}
+	ann := NeedsReplicaAnnouncement{
+		CID:          cidStr,
+		VMId:         vmId,
+		Reason:       reason,
+		SourcePeerID: n.host.ID().String(),
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.Marshal(ann)
+	if err != nil {
+		return
+	}
+	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := topic.Publish(pubCtx, data); err != nil {
+		n.diagLog.Add("needs_replica_publish_fail", map[string]interface{}{
+			"cid":    cidShort(cidStr),
+			"reason": reason,
+			"error":  err.Error(),
+		})
+		return
+	}
+	n.diagLog.Add("needs_replica_publish", map[string]interface{}{
+		"cid":    cidShort(cidStr),
+		"reason": reason,
+		"vmId":   vmId,
+	})
+}
+
+// shouldRespondToNeedsReplica returns true if the per-CID cooldown has elapsed.
+// Stores the current timestamp as a side effect when returning true, so the
+// caller commits to the response before publishing.
+func (n *BlockNode) shouldRespondToNeedsReplica(cidStr string) bool {
+	if v, ok := n.needsReplicaCooldown.Load(cidStr); ok {
+		if last, ok := v.(time.Time); ok && time.Since(last) < NeedsReplicaResponseCooldown {
+			return false
+		}
+	}
+	n.needsReplicaCooldown.Store(cidStr, time.Now())
+	return true
+}
+
+// startNeedsReplicaSubscription joins the needs-replica topic and runs the
+// receive loop. Returns once the topic is joined; the loop runs in a goroutine
+// until ctx is cancelled. Symmetric with startGossipSubSubscription — joining
+// synchronously avoids the GC-fires-before-topic-joined startup race.
+func (n *BlockNode) startNeedsReplicaSubscription(ctx context.Context) error {
+	topic, err := n.pubsub.Join(GossipSubNeedsReplicaTopic)
+	if err != nil {
+		return fmt.Errorf("join needs-replica topic: %w", err)
+	}
+	n.needsReplicaTopic = topic
+	sub, err := topic.Subscribe()
+	if err != nil {
+		return fmt.Errorf("subscribe to needs-replica: %w", err)
+	}
+	go func() {
+		log.Printf("Subscribed to GossipSub topic: %s", GossipSubNeedsReplicaTopic)
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("needs-replica receive error: %v", err)
+				continue
+			}
+			if msg.ReceivedFrom == n.host.ID() {
+				continue // skip our own messages
+			}
+			var ann NeedsReplicaAnnouncement
+			if err := json.Unmarshal(msg.Data, &ann); err != nil {
+				continue
+			}
+			go n.handleNeedsReplica(ctx, ann)
+		}
+	}()
+	return nil
+}
+
+// handleNeedsReplica is the receive-side response. If we hold the block and
+// our per-CID cooldown has expired, re-publish on new-blocks so XOR-close
+// peers can absorb the missing replica via the existing bitswap path. The
+// publishNewBlock helper handles RF lookup from owners/{vmId}.meta (Phase A).
+func (n *BlockNode) handleNeedsReplica(ctx context.Context, ann NeedsReplicaAnnouncement) {
+	c, err := cid.Decode(ann.CID)
+	if err != nil {
+		return
+	}
+	has, _ := n.bstore.Has(ctx, c)
+	if !has {
+		return // we don't hold this block — nothing to re-announce
+	}
+	if !n.shouldRespondToNeedsReplica(ann.CID) {
+		n.diagLog.Add("needs_replica_cooldown_skip", map[string]interface{}{
+			"cid":    cidShort(ann.CID),
+			"reason": ann.Reason,
+		})
+		return
+	}
+	// Look up block size from our LRU tracking (best-effort; default to
+	// BlockSizeBytes if missing, which is correct for VM overlay blocks).
+	n.accessMu.Lock()
+	size := n.blockSizes[ann.CID]
+	n.accessMu.Unlock()
+	if size == 0 {
+		size = BlockSizeBytes
+	}
+	// Re-publish via the normal publisher. publishNewBlock reads owners/{vmId}.meta
+	// (Phase A) for RF, so downstream receivers continue to populate their meta
+	// files from this announcement without orchestrator involvement.
+	n.publishNewBlock(c, size, ann.VMId, 0)
+	n.diagLog.Add("needs_replica_response", map[string]interface{}{
+		"cid":    cidShort(ann.CID),
+		"reason": ann.Reason,
+		"source": cidShort(ann.SourcePeerID),
+	})
+}
+
 // XOR proximity
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1747,6 +1916,12 @@ func (n *BlockNode) runGC(ctx context.Context) (int64, error) {
 	usagePctBefore := float64(usedBefore) / float64(n.cfg.StorageBytes) * 100
 	n.accessMu.Unlock()
  
+	// Build the CID → vmIds inverted index once for this GC pass. Both priority
+	// paths look up VM context per evicted block to attach to needs-replica
+	// announcements; doing this once at the top is O(total CIDs) instead of
+	// O(evicted × VMs).
+	cidOwners := n.buildCIDOwnerIndex()
+
 	var freed int64
 	var evicted int64
  
@@ -1768,6 +1943,19 @@ func (n *BlockNode) runGC(ctx context.Context) (int64, error) {
 			c, err := cid.Decode(e.cid)
 			if err != nil {
 				continue
+			}
+			// Phase B: signal needs-replica BEFORE the delete so XOR-close peers
+			// have maximum time to absorb. One announcement per owning VM so
+			// downstream meta tracking stays consistent under cross-VM dedup
+			// (a single CID can belong to multiple tenant VMs). Empty owners
+			// slice (cross-VM dedup race) → publish with empty vmId.
+			owners := cidOwners[e.cid]
+			if len(owners) == 0 {
+				n.publishNeedsReplica(e.cid, "", "confirmed_evict")
+			} else {
+				for _, vmId := range owners {
+					n.publishNeedsReplica(e.cid, vmId, "confirmed_evict")
+				}
 			}
 			if err := n.bstore.DeleteBlock(ctx, c); err != nil {
 				continue
@@ -1817,9 +2005,32 @@ func (n *BlockNode) runGC(ctx context.Context) (int64, error) {
 		if err != nil {
 			continue
 		}
+		// Phase B: signal needs-replica BEFORE the delete, with one announcement
+		// per owning VM (see Priority 1 comment). Critical for LRU because LRU
+		// evicts UNCONFIRMED blocks — these may be the only or one of the few
+		// remaining copies, making the signal more important than the confirmed
+		// path (where ≥RF remote replicas already exist).
+		owners := cidOwners[e.cid]
+		if len(owners) == 0 {
+			n.publishNeedsReplica(e.cid, "", "lru_evict")
+		} else {
+			for _, vmId := range owners {
+				n.publishNeedsReplica(e.cid, vmId, "lru_evict")
+			}
+		}
 		if err := n.bstore.DeleteBlock(ctx, c); err != nil {
 			continue
 		}
+		// Withdraw DHT provider record so peers stop routing requests to us.
+		// Aligns with Priority 1's behaviour — the LRU path previously left
+		// stranded records until 24h TTL, causing FindProviders to return a
+		// peer that no longer has the block (a real provider-record lie that
+		// would defeat any audit). Phase B closes this gap.
+		go func(c cid.Cid) {
+			wCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = n.dht.Provide(wCtx, c, false)
+		}(c)
 		lruFreed += e.size
 		lruEvicted++
 		n.accessMu.Lock()
@@ -2848,6 +3059,40 @@ func (n *BlockNode) cidHasOtherOwners(excludeOwner, cidStr string) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+// buildCIDOwnerIndex reads every owner file once and returns the CID → vmIds
+// inverted mapping. Used by runGC to attach VM context to needs-replica
+// announcements without scanning owner files for each evicted block (the
+// naïve approach would be O(evicted × VMs); this is O(total CIDs across all
+// owner files)). Called once per GC pass.
+//
+// Memory: ~50 bytes per CID-owner pair. For 1000 VMs × 1000 CIDs/VM that's
+// ~50 MB; for typical deployments (10-100 VMs × 100-1000 CIDs/VM) it's a few
+// hundred KB to a few MB. Acceptable per-pass allocation.
+func (n *BlockNode) buildCIDOwnerIndex() map[string][]string {
+	result := make(map[string][]string)
+	ownersDir := filepath.Join(StorageDir, OwnersSubdir)
+	entries, err := os.ReadDir(ownersDir)
+	if err != nil {
+		return result
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".cids") {
+			continue
+		}
+		vmId := strings.TrimSuffix(e.Name(), ".cids")
+		data, err := os.ReadFile(filepath.Join(ownersDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				result[line] = append(result[line], vmId)
+			}
+		}
+	}
+	return result
 }
 
 // ── GET /diagnostics ─────────────────────────────────────────────────────────
