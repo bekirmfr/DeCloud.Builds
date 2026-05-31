@@ -1030,11 +1030,35 @@ func startAPIServer(port string, state *NodeState) {
 		kadDHT := state.dht
 		state.mu.RUnlock()
 
+		// Routing-table readiness gate. An empty routing table — cold start
+		// after node restart, fresh DHT VM redeploy, or network partition —
+		// means FindProvidersAsync has nowhere to walk and closes its channel
+		// immediately. Returning HTTP 200 with [] would tell the orchestrator
+		// "0 providers" — a false under-replication signal that drains
+		// ConfirmedCids and triggers a spurious full reseed. HTTP 503 lets
+		// the orchestrator's audit loop treat the result as indeterminate
+		// and preserve existing confirmations until we can answer for real.
+		if kadDHT.RoutingTable().Size() == 0 {
+			http.Error(w, "DHT routing table empty — not ready to answer", http.StatusServiceUnavailable)
+			return
+		}
+
 		providerCh := kadDHT.FindProvidersAsync(findCtx, c, 20)
 
 		var providers []string
 		for p := range providerCh {
 			providers = append(providers, p.ID.String())
+		}
+
+		// Walk timed out before finding anything. Distinguishable from a
+		// successful "found zero" walk: if findCtx hit its deadline AND we
+		// got no results, the answer is "I don't know" — not "no providers
+		// exist". Same indeterminate-via-503 rationale as the cold-start
+		// gate above. If the walk found N>0 providers before timing out,
+		// those results are real and we return them.
+		if len(providers) == 0 && findCtx.Err() == context.DeadlineExceeded {
+			http.Error(w, "DHT walk timed out before finding providers", http.StatusServiceUnavailable)
+			return
 		}
 
 		// Track provider lookup in diagnostics
