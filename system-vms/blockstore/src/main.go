@@ -447,7 +447,6 @@ type BlockNode struct {
 	// 5-minute cycle when the network is slow to recover.
 	publishCooldown sync.Map
 }
-}
 
 // ── Debounced per-VM catchup ─────────────────────────────────────────────────
 // Triggered on each successful fetch completion. Resets a 10-second timer per VM.
