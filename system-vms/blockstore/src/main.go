@@ -245,6 +245,11 @@ type ResourceManifest struct {
 	ShardMeta     *ShardMetadata `json:"shardMeta,omitempty"`
 	RegisteredAt  time.Time      `json:"registeredAt"`
 	UpdatedAt     time.Time      `json:"updatedAt"`
+	// ReplicationFactor is the per-VM RF policy. Carried from the daemon's
+	// POST /manifests so the blockstore can persist it locally (owners/{vmId}.meta)
+	// and include it in subsequent new-blocks GossipSub announcements. 0 = unset
+	// (ephemeral VM or pre-Phase-A daemon); omitted from JSON when zero.
+	ReplicationFactor int `json:"replicationFactor,omitempty"`
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -580,6 +585,68 @@ func (n *BlockNode) loadLocalCIDSet(vmId string) map[string]struct{} {
 		}
 	}
 	return result
+}
+
+// ownerMetadata persists per-VM replication policy on the blockstore.
+// Written by handleManifests POST (publisher side, from daemon) and by
+// handleNewBlockAnnouncement (receiver side, from peer GossipSub messages).
+// Read by publishNewBlock so each block announcement carries the current RF
+// without depending on orchestrator round-trips. Phase B/C consume this for
+// survey-loop and needs-replica decisions.
+type ownerMetadata struct {
+	ReplicationFactor int       `json:"replicationFactor"`
+	ManifestVersion   int       `json:"manifestVersion"`
+	LastUpdated       time.Time `json:"lastUpdated"`
+}
+
+// loadOwnerMeta returns the persisted RF policy for a VM. The second return is
+// false when no meta file exists yet — callers should treat this as "unknown",
+// not "RF=0 ephemeral" (the daemon never writes meta for ephemeral VMs, so
+// missing-file means either ephemeral OR pre-Phase-A; the two are conflated
+// safely because both should be skipped by RF-aware logic).
+func (n *BlockNode) loadOwnerMeta(vmId string) (ownerMetadata, bool) {
+	var meta ownerMetadata
+	if vmId == "" {
+		return meta, false
+	}
+	data, err := os.ReadFile(filepath.Join(StorageDir, OwnersSubdir, vmId+".meta"))
+	if err != nil {
+		return meta, false
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return meta, false
+	}
+	return meta, true
+}
+
+// saveOwnerMeta writes owners/{vmId}.meta atomically. Idempotent — repeated
+// writes with the same content are harmless. Skips when rf <= 0 (ephemeral or
+// unknown) so we don't accumulate stale meta files for VMs that won't be
+// surveyed. The atomic write (tmp + rename) protects readers from torn JSON
+// during concurrent updates.
+func (n *BlockNode) saveOwnerMeta(vmId string, rf int, manifestVersion int) {
+	if rf <= 0 || vmId == "" {
+		return
+	}
+	meta := ownerMetadata{
+		ReplicationFactor: rf,
+		ManifestVersion:   manifestVersion,
+		LastUpdated:       time.Now().UTC(),
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return
+	}
+	path := filepath.Join(StorageDir, OwnersSubdir, vmId+".meta")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		log.Printf("owner meta: write tmp failed for VM %s: %v", vmId, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("owner meta: rename tmp failed for VM %s: %v", vmId, err)
+		_ = os.Remove(tmp)
+	}
 }
 
 func cidShort(s string) string {
@@ -947,6 +1014,11 @@ type NewBlockAnnouncement struct {
 	                                                           // drop announcements where their local version
 	                                                           // already equals or exceeds this value, avoiding
 	                                                           // redundant pulls of blocks from stale cycles
+	// ReplicationFactor lets receivers persist the RF policy locally on first pull
+	// (owners/{vmId}.meta), so they can later participate in RF-aware self-healing
+	// (Phase B+) without round-tripping to the orchestrator. 0 = unset (publisher
+	// has no meta file yet, or pre-Phase-A peer). Omitted from JSON when zero.
+	ReplicationFactor int `json:"replicationFactor,omitempty"`
 }
 
 func (n *BlockNode) startGossipSubSubscription(ctx context.Context) error {
@@ -1161,6 +1233,17 @@ func (n *BlockNode) handleNewBlockAnnouncement(ctx context.Context, ann NewBlock
 			}
 		}(ann.VMId, ann.CID)
 	}
+
+	// Persist per-VM RF policy when the announcement carries it. Conditional
+	// on the announcement having a non-zero RF and on either no existing meta
+	// or a newer manifest version — avoids spurious rewrites on every block of
+	// a large burst. saveOwnerMeta is itself a no-op when rf <= 0, but this
+	// guard skips the read path too.
+	if ann.VMId != "" && ann.ReplicationFactor > 0 {
+		if existing, ok := n.loadOwnerMeta(ann.VMId); !ok || ann.ManifestVersion > existing.ManifestVersion {
+			n.saveOwnerMeta(ann.VMId, ann.ReplicationFactor, ann.ManifestVersion)
+		}
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1172,7 +1255,22 @@ func (n *BlockNode) publishNewBlock(c cid.Cid, size int64, ownerVMId string, man
 	if topic == nil {
 		return
 	}
-	ann := NewBlockAnnouncement{CID: c.String(), Size: size, SourceNodeID: n.cfg.NodeID, SourcePeerID: n.host.ID().String(), VMId: ownerVMId, ManifestVersion: manifestVersion}
+	// Look up RF from the local meta file. If absent (ephemeral, pre-Phase-A,
+	// or the publisher's daemon hasn't sent the first manifest yet) the field
+	// stays zero and `omitempty` drops it from the wire — backwards compatible.
+	var rf int
+	if meta, ok := n.loadOwnerMeta(ownerVMId); ok {
+		rf = meta.ReplicationFactor
+	}
+	ann := NewBlockAnnouncement{
+		CID:               c.String(),
+		Size:              size,
+		SourceNodeID:      n.cfg.NodeID,
+		SourcePeerID:      n.host.ID().String(),
+		VMId:              ownerVMId,
+		ManifestVersion:   manifestVersion,
+		ReplicationFactor: rf,
+	}
 	data, err := json.Marshal(ann)
 	if err != nil {
 		return
@@ -2618,6 +2716,14 @@ func (n *BlockNode) handleManifests(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Version file removed — see handleNewBlockAnnouncement.
+
+		// Persist per-VM RF policy for VMOverlay manifests. saveOwnerMeta is a
+		// no-op when ReplicationFactor <= 0 (ephemeral or pre-Phase-A daemon),
+		// so this is safe to call unconditionally. Read by publishNewBlock and
+		// (Phase B+) by the survey/needs-replica handlers.
+		if m.ResourceType == ResourceTypeVMOverlay && m.ResourceID != "" {
+			n.saveOwnerMeta(m.ResourceID, m.ReplicationFactor, m.Version)
+		}
 
 		json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
