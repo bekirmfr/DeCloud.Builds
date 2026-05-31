@@ -433,8 +433,20 @@ type BlockNode struct {
 	// needsReplicaCooldown — per-CID last-response timestamp (CID string → time.Time)
 	// to prevent thundering herd: when many peers observe the same eviction signal,
 	// only those whose cooldown has expired re-publish. Bounded in practice by total
-	// unique CIDs ever signaled; periodic cleanup is a Phase C concern.
+	// unique CIDs ever signaled; periodic cleanup via cleanupCooldownMaps (Phase C).
 	needsReplicaCooldown sync.Map
+
+	// Phase C: shared presence-mesh state replacing the per-goroutine seenPeerURLs.
+	// Populated by the presence subscription on every heartbeat. Read by the
+	// presence-loss monitor (30s tick) and the replication survey (5min tick).
+	presenceState *presenceState
+
+	// publishCooldown — per-CID last-publish timestamp for repair signals from
+	// the publisher side (presence-loss → needs-replica, survey → new-blocks).
+	// 15 min cadence prevents the survey from re-publishing the same CID on every
+	// 5-minute cycle when the network is slow to recover.
+	publishCooldown sync.Map
+}
 }
 
 // ── Debounced per-VM catchup ─────────────────────────────────────────────────
@@ -568,6 +580,231 @@ func (n *BlockNode) diffAndEnqueue(ctx context.Context, vmId, sourcePeerID strin
 			vmId, queued, sourcePeerID[:12])
 	}
 	return queued
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Replication survey (Phase C self-healing)
+// ═══════════════════════════════════════════════════════════════════
+
+// ReplicationSurveyInterval — full survey cadence. 5 min matches the GC cycle
+// and the orchestrator's old audit cadence; the survey is now the primary
+// detector for the "replica node offline" failure class.
+const ReplicationSurveyInterval = 5 * time.Minute
+
+// ReplicationSurveyStartupDelay — gives the presence mesh time to form before
+// the first survey. 60s aligns with the heartbeat publish interval — by then
+// every live peer has at least one heartbeat in our presenceState.
+const ReplicationSurveyStartupDelay = 60 * time.Second
+
+// SurveyConcurrency — per-VM parallel /owners fetches. 16 mirrors the
+// orchestrator's MaxConcurrentProviderChecks for symmetric mesh load.
+const SurveyConcurrency = 16
+
+// startReplicationSurvey periodically checks that every local CID has enough
+// remote replicas. For each VM with RF > 0:
+//   1. Fetch /owners/{vmId} from every presence peer (concurrent, capped).
+//   2. Cache the results in presenceState.peers[*].ownerCids — used by the
+//      presence-loss monitor for fast-path repair on peer death.
+//   3. Count how many peers' indexes contain each local CID.
+//   4. For CIDs with count < RF, publish new-blocks (we hold the CID since
+//      it came from our own owner index — direct advertise > needs-replica
+//      indirection).
+//
+// Concurrency model: serial across VMs, parallel within each VM. The serial
+// outer loop keeps mesh load proportional to mesh size, not local VM count.
+func (n *BlockNode) startReplicationSurvey(ctx context.Context) {
+	select {
+	case <-time.After(ReplicationSurveyStartupDelay):
+	case <-ctx.Done():
+		return
+	}
+	ticker := time.NewTicker(ReplicationSurveyInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n.runReplicationSurvey(ctx)
+		}
+	}
+}
+
+// peerSnapshot is a copy of presenceState data taken under read lock to
+// avoid holding the lock across HTTP fetches.
+type peerSnapshot struct {
+	peerID string
+	apiURL string
+}
+
+func (n *BlockNode) runReplicationSurvey(ctx context.Context) {
+	n.presenceState.mu.RLock()
+	peers := make([]peerSnapshot, 0, len(n.presenceState.peers))
+	for id, p := range n.presenceState.peers {
+		if p.apiURL != "" {
+			peers = append(peers, peerSnapshot{peerID: id, apiURL: p.apiURL})
+		}
+	}
+	n.presenceState.mu.RUnlock()
+
+	if len(peers) == 0 {
+		return // no mesh to survey against — solo node or pre-bootstrap
+	}
+
+	ownersDir := filepath.Join(StorageDir, OwnersSubdir)
+	entries, err := os.ReadDir(ownersDir)
+	if err != nil {
+		return
+	}
+
+	surveyed := 0
+	signaled := 0
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".cids") {
+			continue
+		}
+		vmId := strings.TrimSuffix(e.Name(), ".cids")
+		meta, ok := n.loadOwnerMeta(vmId)
+		if !ok || meta.ReplicationFactor <= 0 {
+			continue // ephemeral (RF=0) or pre-Phase-A meta missing — skip
+		}
+		signaled += n.surveyVM(ctx, vmId, meta.ReplicationFactor, peers)
+		surveyed++
+	}
+	if surveyed > 0 {
+		n.diagLog.Add("replication_survey", map[string]interface{}{
+			"vms":      surveyed,
+			"peers":    len(peers),
+			"signaled": signaled,
+		})
+	}
+}
+
+// surveyVM checks one VM's replication. Returns the number of CIDs that
+// triggered a repair signal in this pass (for diagnostics).
+func (n *BlockNode) surveyVM(ctx context.Context, vmId string, rf int, peers []peerSnapshot) int {
+	// Parallel fetch with bounded concurrency.
+	sem := make(chan struct{}, SurveyConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	cidCount := make(map[string]int) // CID → count of peers holding it for this VM
+
+	for _, p := range peers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(peerID, apiURL string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			cids := n.fetchPeerOwnerCIDs(ctx, apiURL, vmId)
+			n.cacheOwnerCIDs(peerID, vmId, cids)
+			mu.Lock()
+			for _, c := range cids {
+				cidCount[c]++
+			}
+			mu.Unlock()
+		}(p.peerID, p.apiURL)
+	}
+	wg.Wait()
+
+	// For each local CID, check whether the network has enough copies. cidCount
+	// excludes us by construction (presence mesh doesn't include self), so the
+	// comparison "< RF" matches the orchestrator's "remote count < ReplicationFactor"
+	// semantic exactly.
+	localCIDs := n.loadLocalCIDSet(vmId)
+	signaled := 0
+	for cidStr := range localCIDs {
+		if cidCount[cidStr] >= rf {
+			continue
+		}
+		if !n.shouldPublishRepairSignal(cidStr) {
+			continue
+		}
+		// We hold this CID (it's from our local index), so the most direct
+		// repair is publishing it ourselves on new-blocks. XOR-close peers
+		// absorb via the existing bitswap path. publishNewBlock reads RF
+		// from owners/{vmId}.meta (Phase A) so the announcement is fully
+		// populated. Survey doesn't go through needs-replica because we ARE
+		// the source; the indirection through other holders is unnecessary.
+		c, err := cid.Decode(cidStr)
+		if err != nil {
+			continue
+		}
+		size := int64(BlockSizeBytes)
+		n.accessMu.Lock()
+		if s, ok := n.blockSizes[cidStr]; ok && s > 0 {
+			size = s
+		}
+		n.accessMu.Unlock()
+		n.publishNewBlock(c, size, vmId, meta_versionForCID(n, vmId))
+		signaled++
+		n.diagLog.Add("survey_underreplicated", map[string]interface{}{
+			"cid":      cidShort(cidStr),
+			"vmId":     vmId,
+			"observed": cidCount[cidStr],
+			"required": rf,
+		})
+	}
+	return signaled
+}
+
+// fetchPeerOwnerCIDs GETs /owners/{vmId} from a peer's blockstore API.
+// Returns nil on any error — caller treats missing as "peer doesn't hold
+// any blocks for this VM", which is the safe interpretation for repair
+// (under-counts trigger signals rather than over-counts hiding gaps).
+func (n *BlockNode) fetchPeerOwnerCIDs(ctx context.Context, apiURL, vmId string) []string {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet,
+		fmt.Sprintf("%s/owners/%s", apiURL, vmId), nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil // 404 = peer doesn't have this VM, treated as zero CIDs
+	}
+	var data struct {
+		CIDs []string `json:"cids"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil
+	}
+	return data.CIDs
+}
+
+// cacheOwnerCIDs stores the peer's owner index for a VM in presenceState so the
+// presence-loss monitor can signal needs-replica when the peer goes silent.
+// Silently drops if the peer has timed out between fetch start and cache write
+// (the peer entry no longer exists) — the next presence event will repopulate.
+func (n *BlockNode) cacheOwnerCIDs(peerID, vmId string, cids []string) {
+	n.presenceState.mu.Lock()
+	defer n.presenceState.mu.Unlock()
+	p, ok := n.presenceState.peers[peerID]
+	if !ok {
+		return
+	}
+	set := make(map[string]struct{}, len(cids))
+	for _, c := range cids {
+		set[c] = struct{}{}
+	}
+	p.ownerCids[vmId] = set
+}
+
+// meta_versionForCID returns the current manifest version for a VM from the
+// owner meta file. Best-effort: returns 0 if no meta file exists, which is
+// also what publishNewBlock historically used as the unset value.
+func meta_versionForCID(n *BlockNode, vmId string) int {
+	if meta, ok := n.loadOwnerMeta(vmId); ok {
+		return meta.ManifestVersion
+	}
+	return 0
 }
 
 // resolveBlockstoreAPIURL derives the blockstore HTTP API URL (port 5090) from
@@ -729,6 +966,13 @@ func main() {
 	if err := node.startNeedsReplicaSubscription(ctx); err != nil {
 		log.Printf("Warning: needs-replica subscription failed: %v", err)
 	}
+	// Phase C self-healing background loops. Order doesn't matter — they
+	// share state via presenceState (populated by startPresenceTopic above)
+	// and the cooldown sync.Maps. All three are pure consumers/producers of
+	// existing signals; nothing else depends on their startup.
+	go node.startPresenceLossMonitor(ctx)
+	go node.startReplicationSurvey(ctx)
+	go node.startCooldownCleanup(ctx)
 	node.startHTTPServer(ctx)
 	go node.startGCLoop(ctx)
 	for i := 0; i < GossipSubFetchWorkers; i++ {
@@ -865,6 +1109,7 @@ func setup(ctx context.Context, cfg Config) (*BlockNode, error) {
 		catchupTimers: make(map[string]chan struct{}),
 		retryQueue:    make(chan cid.Cid, 500),
 		startTime:     time.Now(),
+		presenceState: &presenceState{peers: make(map[string]*presencePeer)},
 	}, nil
 }
 
@@ -1602,6 +1847,27 @@ type presenceHeartbeat struct {
 	APIURL string `json:"apiUrl"`
 }
 
+// presencePeer is the in-memory state for one peer in the presence mesh.
+// Updated on each heartbeat receive (apiURL, lastHeartbeat) and on each
+// replication survey cycle (ownerCids cache, refreshed from /owners/{vmId}).
+// ownerCids: vmId → set of CIDs the peer claims to hold for that VM, used by
+// the presence-loss monitor to signal needs-replica when this peer goes silent.
+type presencePeer struct {
+	apiURL        string
+	lastHeartbeat time.Time
+	ownerCids     map[string]map[string]struct{}
+}
+
+// presenceState is the shared liveness view of the blockstore mesh. Multiple
+// goroutines read and write it (presence subscription on heartbeat, presence
+// monitor on timeout, replication survey on cache refresh) so all accesses
+// go through mu. Bounded by the number of unique peer IDs ever seen; entries
+// are removed on heartbeat timeout, so steady-state size matches the live mesh.
+type presenceState struct {
+	mu    sync.RWMutex
+	peers map[string]*presencePeer // key: peer ID string
+}
+
 // startPresenceTopic joins the blockstore-only presence topic.
 // DHT VMs never join this topic — ListPeers(presence) = exact blockstore count.
 // Also publishes heartbeats and triggers owner-based catchup for new peers.
@@ -1639,12 +1905,12 @@ func (n *BlockNode) startPresenceTopic(ctx context.Context) {
 		}
 	}()
 
-	// Watch for peers. Re-trigger catchup whenever a peer's API URL changes —
-	// this handles redeploys that preserve the peer ID (same identity.key on
-	// persistent disk) but represent a new VM instance with a fresh owner index.
-	// Repeated heartbeats with the same peerID+URL are de-duplicated by the map.
+	// Watch for peers. On every heartbeat, update the shared presenceState
+	// (replaces the per-goroutine seenPeerURLs map — Phase C makes this state
+	// readable by the presence-loss monitor and the replication survey). Only
+	// trigger catchup when a peer is new or its APIURL changed; repeated
+	// heartbeats with the same peerID+URL refresh the timestamp silently.
 	go func() {
-		seenPeerURLs := make(map[string]string) // peerID → last seen APIURL
 		for {
 			msg, err := sub.Next(ctx)
 			if err != nil {
@@ -1657,10 +1923,25 @@ func (n *BlockNode) startPresenceTopic(ctx context.Context) {
 			if err := json.Unmarshal(msg.Data, &hb); err != nil || hb.APIURL == "" {
 				continue
 			}
-			if seenPeerURLs[hb.PeerID] == hb.APIURL {
+
+			n.presenceState.mu.Lock()
+			existing, ok := n.presenceState.peers[hb.PeerID]
+			urlChanged := !ok || existing.apiURL != hb.APIURL
+			if ok {
+				existing.apiURL = hb.APIURL
+				existing.lastHeartbeat = time.Now()
+			} else {
+				n.presenceState.peers[hb.PeerID] = &presencePeer{
+					apiURL:        hb.APIURL,
+					lastHeartbeat: time.Now(),
+					ownerCids:     make(map[string]map[string]struct{}),
+				}
+			}
+			n.presenceState.mu.Unlock()
+
+			if !urlChanged {
 				continue
 			}
-			seenPeerURLs[hb.PeerID] = hb.APIURL
 			libp2pPeerID, parseErr := peer.Decode(hb.PeerID)
 			if parseErr != nil {
 				log.Printf("Presence: could not parse peer ID %s: %v", hb.PeerID, parseErr)
@@ -1830,8 +2111,159 @@ func (n *BlockNode) dhtProvide(ctx context.Context, c cid.Cid) error {
 	return lastErr
 }
 
-// blockstorePeerCount returns the number of other blockstore nodes
-// currently in the GossipSub presence mesh. Updates live as nodes
+// ═══════════════════════════════════════════════════════════════════
+// Presence-loss monitor (Phase C self-healing)
+// ═══════════════════════════════════════════════════════════════════
+
+// PresenceTimeout — how long after the last heartbeat we consider a peer gone.
+// Anchor: 3× heartbeat interval (60s × 3 = 180s). Two missed heartbeats might
+// be network jitter; three is a confident loss signal.
+const PresenceTimeout = 180 * time.Second
+
+// PresenceCheckInterval — how often the monitor wakes to scan for timeouts.
+// 30s gives 6× the resolution of the heartbeat interval — fast enough that the
+// upper bound on detection latency is PresenceTimeout + PresenceCheckInterval.
+const PresenceCheckInterval = 30 * time.Second
+
+// PublishCooldown — per-CID rate limit on publisher-side repair signals
+// (presence-loss → needs-replica, survey → new-blocks). 15 min prevents the
+// survey from re-publishing the same CID on every 5-minute cycle while the
+// network catches up. Independent of the receiver-side NeedsReplicaResponseCooldown
+// (60s) — receivers can still respond promptly to fresh signals from other peers.
+const PublishCooldown = 15 * time.Minute
+
+// shouldPublishRepairSignal returns true if the per-CID publish cooldown has
+// elapsed, atomically updating the timestamp as a side effect. Used by both
+// presence-loss publishing and survey publishing; one cooldown map covers both
+// because either signal serves the same purpose (provoke replica restoration).
+func (n *BlockNode) shouldPublishRepairSignal(cidStr string) bool {
+	if v, ok := n.publishCooldown.Load(cidStr); ok {
+		if last, ok := v.(time.Time); ok && time.Since(last) < PublishCooldown {
+			return false
+		}
+	}
+	n.publishCooldown.Store(cidStr, time.Now())
+	return true
+}
+
+// CooldownCleanupInterval — how often we sweep stale entries from both
+// cooldown maps. 1 hour gives plenty of headroom over both cooldown windows
+// (60s response, 15 min publish); entries older than this are guaranteed to
+// no longer suppress anything, so deleting them is purely memory hygiene.
+const CooldownCleanupInterval = 1 * time.Hour
+
+// startCooldownCleanup periodically walks both cooldown maps and removes
+// entries whose timestamps are older than the maximum cooldown window. The
+// maps are sync.Map (lock-free reads, atomic stores), so Range during cleanup
+// doesn't block hot-path Loads/Stores. Bounded growth: without this loop, the
+// maps accumulate one entry per unique CID ever signaled — fine for short-
+// lived nodes, problematic for nodes that have been up for months.
+func (n *BlockNode) startCooldownCleanup(ctx context.Context) {
+	ticker := time.NewTicker(CooldownCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n.sweepCooldown(&n.needsReplicaCooldown, NeedsReplicaResponseCooldown)
+			n.sweepCooldown(&n.publishCooldown, PublishCooldown)
+		}
+	}
+}
+
+// sweepCooldown removes entries from m whose timestamp is older than 2× window
+// (entries can no longer suppress anything once past the window). Two passes
+// rather than collecting into a slice and deleting because sync.Map.Delete is
+// safe to call during Range.
+func (n *BlockNode) sweepCooldown(m *sync.Map, window time.Duration) {
+	cutoff := time.Now().Add(-2 * window)
+	removed := 0
+	m.Range(func(k, v interface{}) bool {
+		if t, ok := v.(time.Time); ok && t.Before(cutoff) {
+			m.Delete(k)
+			removed++
+		}
+		return true
+	})
+	if removed > 0 {
+		n.diagLog.Add("cooldown_sweep", map[string]interface{}{
+			"removed": removed,
+		})
+	}
+}
+
+// startPresenceLossMonitor wakes every PresenceCheckInterval and detects peers
+// whose last heartbeat is older than PresenceTimeout. For each lost peer, signals
+// needs-replica for the cached owner indexes (populated by the replication survey)
+// so XOR-close peers can re-replicate before the orchestrator audit would have
+// noticed. Removes the lost peer from presenceState so a re-joining peer
+// re-triggers catchup via the heartbeat receiver.
+//
+// Cache-empty case: if the survey hasn't yet populated ownerCids for a lost
+// peer (peer joined and died within one survey cycle), this monitor publishes
+// nothing for that peer — the next survey will detect the under-replication
+// via cidCount and signal it. This is the acceptable slow path.
+func (n *BlockNode) startPresenceLossMonitor(ctx context.Context) {
+	ticker := time.NewTicker(PresenceCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n.detectAndSignalPresenceLoss()
+		}
+	}
+}
+
+// detectAndSignalPresenceLoss is one pass of the presence-loss monitor.
+// Identifies timed-out peers, removes them from state under write lock,
+// then publishes needs-replica for each cached CID outside the lock to
+// avoid holding it across GossipSub publish latency.
+func (n *BlockNode) detectAndSignalPresenceLoss() {
+	cutoff := time.Now().Add(-PresenceTimeout)
+
+	type lostEntry struct {
+		peerID    string
+		ownerCids map[string]map[string]struct{}
+	}
+	var lost []lostEntry
+
+	n.presenceState.mu.Lock()
+	for peerID, p := range n.presenceState.peers {
+		if p.lastHeartbeat.Before(cutoff) {
+			lost = append(lost, lostEntry{
+				peerID:    peerID,
+				ownerCids: p.ownerCids,
+			})
+			delete(n.presenceState.peers, peerID)
+		}
+	}
+	n.presenceState.mu.Unlock()
+
+	for _, l := range lost {
+		cidCount := 0
+		for _, set := range l.ownerCids {
+			cidCount += len(set)
+		}
+		log.Printf("Presence: peer %s timed out — signaling needs-replica for %d cached CIDs",
+			cidShort(l.peerID), cidCount)
+		n.diagLog.Add("presence_loss_detected", map[string]interface{}{
+			"peer":     cidShort(l.peerID),
+			"cids":     cidCount,
+			"vmCount":  len(l.ownerCids),
+		})
+		for vmId, set := range l.ownerCids {
+			for cidStr := range set {
+				if !n.shouldPublishRepairSignal(cidStr) {
+					continue
+				}
+				n.publishNeedsReplica(cidStr, vmId, "presence_loss")
+			}
+		}
+	}
+}
 // join and leave — no polling, no orchestrator intervention needed.
 func (n *BlockNode) blockstorePeerCount() int {
 	return len(n.pubsub.ListPeers(GossipSubPresenceTopic))
