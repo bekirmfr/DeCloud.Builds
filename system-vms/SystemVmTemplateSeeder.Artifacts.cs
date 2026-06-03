@@ -7,7 +7,7 @@
 // DO NOT EDIT MANUALLY — regenerate from source files in DeCloud.Builds.
 // ============================================================
 
-// Generated: 2026-05-30T21:19:04Z
+// Generated: 2026-05-31T10:15:45Z
 
 namespace Orchestrator.Services.SystemVm;
 
@@ -119,7 +119,7 @@ public sealed partial class SystemVmTemplateSeeder
 
 
     // ── Summary ─────────────────────────────────────────────────────────────────
-    // Generated: 2026-05-30T21:19:18Z
+    // Generated: 2026-05-31T10:15:52Z
     // Roles discovered:
     //   shared/assets/ [prefix='<none>']: 5 files
     //   blockstore/assets/ [prefix='Blockstore']: 7 files

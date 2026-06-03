@@ -2811,6 +2811,7 @@ func (n *BlockNode) startHTTPServer(ctx context.Context) {
 	mux.HandleFunc("/version", n.handleVersion)
 	mux.HandleFunc("/health", n.handleHealth)
 	mux.HandleFunc("/health/mesh", n.handleHealthMesh)
+	mux.HandleFunc("/blocks/has", n.handleBlocksHas)
 	mux.HandleFunc("/blocks/", n.handleBlock)
 	mux.HandleFunc("/blocks", n.handleBlocks)
 	mux.HandleFunc("/stats", n.handleStats)
@@ -2988,9 +2989,56 @@ func (n *BlockNode) getBlock(w http.ResponseWriter, r *http.Request, c cid.Cid) 
 	} else {
 		n.touchBlock(c.String(), int64(len(blk.RawData())))
 	}
+	// Write to owner index if ?owner= is present. Covers ReconstructOverlayAsync
+	// on the receiving node: blocks fetched here land in the blockstore but were
+	// previously invisible to /owners/{vmId} and the pre-flight check.
+	if owner := r.URL.Query().Get("owner"); owner != "" {
+		go func(ownerID, cidStr string) {
+			ownerFile := filepath.Join(StorageDir, OwnersSubdir, ownerID+".cids")
+			f, err := os.OpenFile(ownerFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				return
+			}
+			defer f.Close()
+			fmt.Fprintln(f, cidStr)
+		}(owner, c.String())
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Block-CID", c.String())
 	_, _ = w.Write(blk.RawData())
+}
+
+// ── POST /blocks/has ─────────────────────────────────────────────────────────
+// Accepts {"cids":[...]} and returns {"present":[...]} — the subset locally
+// stored. Used by the orchestrator's migration pre-flight to verify raw block
+// presence independently of ownership metadata, so a target node that received
+// blocks via reconstruction (GET /blocks/{cid}?owner=) or any other path is
+// correctly detected as holding the data.
+func (n *BlockNode) handleBlocksHas(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		CIDs []string `json:"cids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	present := make([]string, 0, len(req.CIDs))
+	for _, cidStr := range req.CIDs {
+		c, err := cid.Decode(cidStr)
+		if err != nil {
+			continue
+		}
+		if has, _ := n.bstore.Has(ctx, c); has {
+			present = append(present, cidStr)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"present": present})
 }
 
 func (n *BlockNode) deleteBlock(w http.ResponseWriter, r *http.Request, c cid.Cid) {

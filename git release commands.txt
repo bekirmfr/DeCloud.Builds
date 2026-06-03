@@ -1,6 +1,6 @@
 if a previous release needs override:
-	git tag -d binaries/v1.1.0
-	git push --delete origin binaries/v1.1.0
+	git tag -d binaries/v1.1.2
+	git push --delete origin binaries/v1.1.2
 
-git tag binaries/v1.1.0 -m "Release system vm binaries"
-git push origin binaries/v1.1.0
+git tag binaries/v1.1.2 -m "Release system vm binaries"
+git push origin binaries/v1.1.2
