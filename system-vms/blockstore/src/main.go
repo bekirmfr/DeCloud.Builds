@@ -2043,7 +2043,8 @@ func (n *BlockNode) performCatchupFromPeer(ctx context.Context, peerAPIURL strin
 			if err := n.bstore.Put(ctx, blk); err != nil {
 				continue
 			}
-			n.touchBlock(blk.Cid().String(), int64(len(blk.RawData())))
+			cidStr := blk.Cid().String()
+			n.touchBlock(cidStr, int64(len(blk.RawData())))
 			n.mu.Lock()
 			n.bitswapReceived++
 			n.mu.Unlock()
@@ -2052,8 +2053,21 @@ func (n *BlockNode) performCatchupFromPeer(ctx context.Context, peerAPIURL strin
 				defer aCancel()
 				_ = n.dht.Provide(aCtx, c, true)
 			}(blk.Cid())
+			// Write to owner index — the catchup path knows vmId from the
+			// /owners list it fetched from the peer. Without this, blocks
+			// pulled via catchup are present and DHT-announced but invisible
+			// to /owners/{vmId} queries and the replication survey.
+			go func(ownerID, cStr string) {
+				ownerFile := filepath.Join(StorageDir, OwnersSubdir, ownerID+".cids")
+				f, err := os.OpenFile(ownerFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					return
+				}
+				defer f.Close()
+				fmt.Fprintln(f, cStr)
+			}(vmId, cidStr)
 			n.diagLog.Add("catchup_fetch", map[string]interface{}{
-				"cid": cidShort(blk.Cid().String()), "vmId": vmId,
+				"cid": cidShort(cidStr), "vmId": vmId,
 			})
 			pulled++
 		}
