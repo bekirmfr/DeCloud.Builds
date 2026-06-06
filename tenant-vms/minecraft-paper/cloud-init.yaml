@@ -1,0 +1,278 @@
+#cloud-config
+
+# DeCloud Minecraft Paper Server Role Layer
+#
+# Composed with base-tenant.yaml by TemplateComposer at seed time to form
+# the minecraft-paper VmTemplate.
+#
+# Platform concerns (root password, SSH password auth, sshd_config drop-in,
+# qemu-guest-agent, SSH CA, hostname, machine-id) are provided by
+# base-tenant.yaml. This file carries ONLY the Minecraft Paper workload.
+#
+# This file is NOT deployed standalone.
+#
+# Substitution conventions:
+#   __VARNAME__  — orchestrator render-time, declared in
+#                  TemplateSeederService.BuildMinecraftVariables() and
+#                  resolved by CloudInitRenderer.
+#   ${VAR}       — bash runtime expansion inside shell scripts
+#                  (NOT a render-time substitution).
+#
+# CLOUD-INIT YAML RULES (enforced by parser):
+#   1. NO heredocs (<<EOF) at column 0 in runcmd. They place content at
+#      column 0 which the cloud-init YAML parser misreads as a new
+#      top-level document and silently skips the entire runcmd.
+#   2. All static file content goes in write_files (properly indented).
+#   3. Dynamic content in runcmd uses printf / python3 -c / sed -i.
+#   4. setup.sh below is a full bash script delivered via write_files —
+#      it CAN use heredocs internally because by the time bash runs it,
+#      YAML parsing is done. The PYEOF terminator must sit at column 0
+#      of the parsed bash content (i.e. at the same indent as the rest
+#      of the script's column-0 lines under the `|` block scalar).
+
+# Minecraft needs apt to refresh for openjdk-21-jre-headless on Ubuntu 22.04.
+# base-tenant.yaml does not declare package_update/package_upgrade, so these
+# are role-exclusive (TemplateComposer ScalarExclusive — no collision).
+package_update: true
+package_upgrade: true
+
+packages:
+  # qemu-guest-agent, curl, jq, openssl are provided by base-tenant.yaml.
+  # ListUnion deduplicates if a role re-declares, but we omit duplicates
+  # to keep the role layer focused on workload-specific packages.
+  - openjdk-21-jre-headless
+  - python3
+
+write_files:
+
+  # ── server.properties ──────────────────────────────────────────────────
+  # User-supplied variables are substituted at render time.
+  # The RCON password is generated at runtime and patched in by setup.sh.
+  - path: /opt/minecraft/server.properties
+    owner: root:root
+    permissions: '0640'
+    content: |
+      #Minecraft server properties
+      online-mode=true
+      server-port=25565
+      query.port=25565
+      enable-query=false
+      motd=__SERVER_MOTD__
+      max-players=__MAX_PLAYERS__
+      difficulty=__DIFFICULTY__
+      gamemode=__GAMEMODE__
+      enable-whitelist=false
+      spawn-protection=16
+      allow-nether=true
+      allow-flight=false
+      pvp=true
+      level-seed=
+      enable-rcon=true
+      rcon.port=25575
+      rcon.password=RCON_PASSWORD_PLACEHOLDER
+
+  # ── start.sh ───────────────────────────────────────────────────────────
+  # Calculates JVM heap at service start time (75% of installed RAM).
+  # Uses Aikar's flags — the Paper-recommended JVM tuning set.
+  - path: /opt/minecraft/start.sh
+    owner: minecraft:minecraft
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+      JVM_HEAP_MB=$((TOTAL_MEM_KB / 1024 * 75 / 100))
+      exec java \
+        -Xms512M -Xmx${JVM_HEAP_MB}M \
+        -XX:+UseG1GC \
+        -XX:+ParallelRefProcEnabled \
+        -XX:MaxGCPauseMillis=200 \
+        -XX:+UnlockExperimentalVMOptions \
+        -XX:+DisableExplicitGC \
+        -XX:+AlwaysPreTouch \
+        -XX:G1NewSizePercent=30 \
+        -XX:G1MaxNewSizePercent=40 \
+        -XX:G1HeapRegionSize=8M \
+        -XX:G1ReservePercent=20 \
+        -XX:G1HeapWastePercent=5 \
+        -XX:G1MixedGCCountTarget=4 \
+        -XX:InitiatingHeapOccupancyPercent=15 \
+        -XX:G1MixedGCLiveThresholdPercent=90 \
+        -XX:G1RSetUpdatingPauseTimePercent=5 \
+        -XX:SurvivorRatio=32 \
+        -XX:+PerfDisableSharedMem \
+        -XX:MaxTenuringThreshold=1 \
+        -Dusing.aikars.flags=true \
+        -jar /opt/minecraft/paper.jar --nogui
+
+  # ── rcon.py ────────────────────────────────────────────────────────────
+  # Minimal RCON client. Used for graceful shutdown and for the server
+  # management examples in the long description.
+  # Usage: python3 /opt/minecraft/rcon.py <password> <command>
+  # Exit 0 = success, exit 1 = connection failed (server not running).
+  - path: /opt/minecraft/rcon.py
+    owner: minecraft:minecraft
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      import socket, struct, sys, time
+
+      HOST, PORT = '127.0.0.1', 25575
+
+      def packet(req_id, pkt_type, payload):
+          body = payload.encode() + b'\x00\x00'
+          return struct.pack('<iii', len(body) + 8, req_id, pkt_type) + body
+
+      def recv_packet(s):
+          def read(n):
+              buf = b''
+              while len(buf) < n:
+                  chunk = s.recv(n - len(buf))
+                  if not chunk:
+                      raise ConnectionError('Connection closed')
+                  buf += chunk
+              return buf
+          length = struct.unpack('<i', read(4))[0]
+          data = read(length)
+          req_id, pkt_type = struct.unpack('<ii', data[:8])
+          return req_id, pkt_type, data[8:-2].decode(errors='replace')
+
+      def main():
+          if len(sys.argv) < 3:
+              print('Usage: rcon.py <password> <command>', file=sys.stderr)
+              sys.exit(2)
+          password, command = sys.argv[1], ' '.join(sys.argv[2:])
+          try:
+              with socket.create_connection((HOST, PORT), timeout=10) as s:
+                  s.sendall(packet(1, 3, password))
+                  req_id, _, _ = recv_packet(s)
+                  if req_id == -1:
+                      print('Authentication failed', file=sys.stderr)
+                      sys.exit(1)
+                  s.sendall(packet(2, 2, command))
+                  _, _, response = recv_packet(s)
+                  if response:
+                      print(response)
+          except Exception as e:
+              print(f'RCON error: {e}', file=sys.stderr)
+              sys.exit(1)
+
+      if __name__ == '__main__':
+          main()
+
+  # ── minecraft.service ──────────────────────────────────────────────────
+  # ExecStop sends 'stop' via RCON which triggers Paper's graceful shutdown
+  # (world save, player disconnect, clean exit). TimeoutStopSec gives the
+  # server 60 s to complete the save before systemd sends SIGKILL.
+  - path: /etc/systemd/system/minecraft.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Minecraft Paper Server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=minecraft
+      Group=minecraft
+      WorkingDirectory=/opt/minecraft
+      ExecStart=/opt/minecraft/start.sh
+      ExecStop=python3 /opt/minecraft/rcon.py RCON_PASSWORD_PLACEHOLDER stop
+      Restart=on-failure
+      RestartSec=30
+      TimeoutStopSec=60
+      StandardOutput=journal
+      StandardError=journal
+      SyslogIdentifier=minecraft
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ── setup.sh ───────────────────────────────────────────────────────────
+  # Runs once at first boot via runcmd.
+  # Downloads Paper, generates the RCON password, patches server.properties
+  # and the systemd unit, then starts the service.
+  # This file is in write_files so the bash script content can use heredocs
+  # internally without breaking cloud-init's YAML parser.
+  - path: /opt/minecraft/setup.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      MC_VERSION="__MINECRAFT_VERSION__"
+      INSTALL_DIR="/opt/minecraft"
+
+      log() { echo "[DeCloud/minecraft] $*"; }
+
+      # ── Create system user ────────────────────────────────────────────
+      if ! id minecraft &>/dev/null; then
+        useradd --system --shell /usr/sbin/nologin --home-dir "$INSTALL_DIR" minecraft
+      fi
+      mkdir -p "$INSTALL_DIR/plugins"
+      chown -R minecraft:minecraft "$INSTALL_DIR"
+
+      # ── Download Paper ────────────────────────────────────────────────
+      log "Fetching Paper ${MC_VERSION} build info..."
+      BUILD=$(python3 - <<'PYEOF'
+      import urllib.request, json, sys
+      version = '__MINECRAFT_VERSION__'
+      url = f'https://api.papermc.io/v2/projects/paper/versions/{version}/builds/'
+      with urllib.request.urlopen(url, timeout=30) as r:
+          data = json.load(r)
+      stable = [b for b in data['builds'] if b.get('channel') == 'STABLE']
+      builds = stable if stable else data['builds']
+      print(builds[-1]['build'])
+      PYEOF
+      )
+
+      log "Downloading Paper ${MC_VERSION} build ${BUILD}..."
+      curl -sf -o "$INSTALL_DIR/paper.jar" \
+        "https://api.papermc.io/v2/projects/paper/versions/${MC_VERSION}/builds/${BUILD}/downloads/paper-${MC_VERSION}-${BUILD}.jar"
+      chown minecraft:minecraft "$INSTALL_DIR/paper.jar"
+
+      # ── Accept EULA ───────────────────────────────────────────────────
+      echo 'eula=true' > "$INSTALL_DIR/eula.txt"
+      chown minecraft:minecraft "$INSTALL_DIR/eula.txt"
+
+      # ── Generate RCON password ────────────────────────────────────────
+      RCON_PASS=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+      echo "$RCON_PASS" > "$INSTALL_DIR/.rcon-password"
+      chmod 600 "$INSTALL_DIR/.rcon-password"
+      chown minecraft:minecraft "$INSTALL_DIR/.rcon-password"
+
+      # ── Patch RCON password into server.properties and service unit ───
+      # The placeholder 'RCON_PASSWORD_PLACEHOLDER' was written by cloud-init
+      # write_files; we replace it here with the actual generated password.
+      sed -i "s|RCON_PASSWORD_PLACEHOLDER|${RCON_PASS}|g" \
+        "$INSTALL_DIR/server.properties" \
+        /etc/systemd/system/minecraft.service
+
+      chown minecraft:minecraft "$INSTALL_DIR/server.properties"
+
+      # ── Enable and start service ──────────────────────────────────────
+      systemctl daemon-reload
+      systemctl enable minecraft
+      systemctl start minecraft
+
+      log "Paper ${MC_VERSION} build ${BUILD} is starting."
+      log "Connect: __HOSTNAME__:25565"
+      log "RCON password saved to $INSTALL_DIR/.rcon-password"
+
+runcmd:
+  - bash /opt/minecraft/setup.sh
+
+# Role wins over base on final_message (TemplateComposer ScalarRoleWins).
+# Base's default ("DeCloud VM __VM_NAME__ is ready!") is replaced with the
+# workload-specific welcome below.
+final_message: |
+  Minecraft Paper Server is starting up!
+
+  Server address: __HOSTNAME__:25565
+  First boot needs ~2-3 minutes for Java install + Paper download.
+
+  SSH: ssh root@__HOSTNAME__  (password set via __ADMIN_PASSWORD__)
+  Logs: journalctl -u minecraft -f
+  RCON password: cat /opt/minecraft/.rcon-password
