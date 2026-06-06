@@ -75,7 +75,6 @@ write_files:
   # Calculates JVM heap at service start time (75% of installed RAM).
   # Uses Aikar's flags — the Paper-recommended JVM tuning set.
   - path: /opt/minecraft/start.sh
-    owner: minecraft:minecraft
     permissions: '0755'
     content: |
       #!/bin/bash
@@ -110,7 +109,6 @@ write_files:
   # Usage: python3 /opt/minecraft/rcon.py <password> <command>
   # Exit 0 = success, exit 1 = connection failed (server not running).
   - path: /opt/minecraft/rcon.py
-    owner: minecraft:minecraft
     permissions: '0755'
     content: |
       #!/usr/bin/env python3
