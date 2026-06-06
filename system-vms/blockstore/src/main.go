@@ -2847,11 +2847,33 @@ func (n *BlockNode) startHTTPServer(ctx context.Context) {
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	go func() {
 		log.Printf("HTTP API listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Self-watchdog: if the HTTP server stops responding, exit so
+	// systemd restarts the process — faster than waiting for the
+	// node agent to delete and redeploy the entire VM.
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		time.Sleep(10 * time.Second)
+		for {
+			time.Sleep(30 * time.Second)
+			resp, err := client.Get("http://" + addr + "/health")
+			if err != nil {
+				log.Printf("WATCHDOG: self-health-check failed: %v — exiting", err)
+				os.Exit(1)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("WATCHDOG: self-health-check returned %d — exiting", resp.StatusCode)
+				os.Exit(1)
+			}
 		}
 	}()
 	go func() {

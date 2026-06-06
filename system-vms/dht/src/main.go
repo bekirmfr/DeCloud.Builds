@@ -1219,8 +1219,38 @@ func startAPIServer(port string, state *NodeState) {
 	})
 
 	addr := fmt.Sprintf("127.0.0.1:%s", port)
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Self-watchdog: if the HTTP server stops responding, exit so
+	// systemd restarts the process — faster than waiting for the
+	// node agent to delete and redeploy the entire VM.
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		// Wait for server to start
+		time.Sleep(10 * time.Second)
+		for {
+			time.Sleep(30 * time.Second)
+			resp, err := client.Get("http://" + addr + "/health")
+			if err != nil {
+				log.Printf("WATCHDOG: self-health-check failed: %v — exiting", err)
+				os.Exit(1)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("WATCHDOG: self-health-check returned %d — exiting", resp.StatusCode)
+				os.Exit(1)
+			}
+		}
+	}()
+
 	log.Printf("HTTP API listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP API server failed: %v", err)
 	}
 }
