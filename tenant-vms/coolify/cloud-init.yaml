@@ -1,0 +1,113 @@
+## DeCloud role layer: Coolify (self-hosted PaaS)
+##
+## Composed onto base-templates/base-tenant.yaml by TemplateComposer.
+## The base layer owns the platform invariants — hostname, SSH password auth,
+## chpasswd bootcmd, sshd drop-in, qemu-guest-agent package, the SSH CA, and
+## the orchestrator-url file. This role layer carries ONLY the Coolify
+## workload.
+##
+## Merge behaviour (TemplateComposer):
+##   - write_files / runcmd      → ListConcat (base entries first, role after)
+##   - packages                  → ListUnion
+##   - final_message             → ScalarRoleWins (this layer's value is used)
+##
+## write_files DESIGN NOTE (2026-06-06 incident lesson):
+## Every file written here is owner root:root. cloud-init's write_files runs
+## during the config stage, BEFORE any runcmd has executed and BEFORE any
+## non-default user exists. Declaring owner: <someuser> on a write_files entry
+## whose user is created later (in runcmd) makes cc_write_files raise on the
+## chown and abort the ENTIRE write_files list. Coolify runs as root and its
+## installer owns /data/coolify itself (9999:root), so there is no non-root
+## owner to declare here. Keep it that way.
+
+write_files:
+  # ── coolify-setup.sh ───────────────────────────────────────────────────
+  # Runs once at first boot via runcmd. Generates a strong admin credential,
+  # persists it for retrieval over SSH, then runs Coolify's official installer
+  # with the root-user env vars so the instance admin is pre-created at boot.
+  #
+  # Why this is in write_files (not inline in runcmd): the script body uses
+  # its own quoting and a curl|bash pipe; keeping it as a literal block scalar
+  # keeps cloud-init's YAML parser away from the shell syntax.
+  - path: /opt/decloud/coolify-setup.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      CRED_FILE="/opt/decloud/coolify-admin"
+      log() { echo "[DeCloud/coolify] $*"; }
+
+      mkdir -p /opt/decloud
+
+      # ── Generate the instance admin credential ───────────────────────────
+      # Pre-seeding the root user via env CLOSES the "first visitor becomes
+      # admin" window that Coolify warns about: RootUserSeeder creates this
+      # user at boot, and once it exists the public registration page is
+      # disabled. The credential is generated on the VM and never leaves it —
+      # the operator retrieves it over SSH (see final_message).
+      #
+      # Password is built to satisfy upper/lower/digit/symbol complexity.
+      # NOTE: confirm against Coolify's current validation rules during Gate 4.
+      ADMIN_USERNAME="admin"
+      ADMIN_EMAIL="admin@__HOSTNAME__.coolify.local"
+      ADMIN_PASSWORD="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9')Aa1#"
+
+      umask 077
+      cat > "$CRED_FILE" <<EOF
+      DeCloud — Coolify instance admin
+      ================================
+      Dashboard : https://__DECLOUD_DOMAIN__
+      Email     : $ADMIN_EMAIL
+      Username  : $ADMIN_USERNAME
+      Password  : $ADMIN_PASSWORD
+
+      The public registration page is DISABLED — this admin was pre-created
+      at boot. Log in with the credentials above. Change the password from
+      Settings after first login if you wish.
+      EOF
+      chmod 600 "$CRED_FILE"
+
+      # ── Install Coolify ──────────────────────────────────────────────────
+      # Official installer. Installs Docker Engine 24+, curl/wget/git/jq/
+      # openssl, sets up /data/coolify, and starts the Coolify containers.
+      # The dashboard listens on :8000 (HTTP). Pulls several images — allow
+      # a few minutes on first boot.
+      log "Installing Coolify (pulls Docker + Coolify containers; ~2-5 min)..."
+      env ROOT_USERNAME="$ADMIN_USERNAME" \
+          ROOT_USER_EMAIL="$ADMIN_EMAIL" \
+          ROOT_USER_PASSWORD="$ADMIN_PASSWORD" \
+          bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
+
+      log "Coolify installed. Dashboard on :8000 (routed via CentralIngress)."
+      log "Admin credentials saved to $CRED_FILE"
+
+runcmd:
+  # Start QEMU guest agent (static unit — systemctl enable fails silently on
+  # the cloud image, so symlink directly; mirrors the validated Minecraft
+  # role pattern).
+  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+  - systemctl start qemu-guest-agent
+
+  # Install + configure Coolify.
+  - bash /opt/decloud/coolify-setup.sh
+
+# Role wins over base on final_message (TemplateComposer ScalarRoleWins).
+final_message: |
+  Coolify is installing!
+
+  Dashboard: https://__DECLOUD_DOMAIN__
+  First boot needs ~2-5 minutes to pull Docker + Coolify images.
+
+  Your instance admin was pre-created (public registration is disabled).
+  Retrieve the login credentials over SSH:
+
+    ssh root@__HOSTNAME__            (password: see your DeCloud VM details)
+    cat /opt/decloud/coolify-admin
+
+  Then open the dashboard, connect a Git repo, and deploy your first app.
+
+  Tip: in Coolify → Settings, set the Instance Domain to your DeCloud
+  subdomain to enable live deploy-log streaming and to serve your deployed
+  apps with automatic HTTPS.
