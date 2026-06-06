@@ -86,6 +86,12 @@ async function initializeDashboard() {
                 CONFIG.relayName = status.relay_name ?? CONFIG.relayName;
                 CONFIG.relayRegion = status.region ?? CONFIG.relayRegion;
                 CONFIG.relayCapacity = status.max_capacity ?? CONFIG.relayCapacity;
+                // Host node ID — used to separate the relay host's own system VMs
+                // ("Relay Host Infrastructure") from CGNAT-owned ones. The artifact
+                // pipeline never substitutes __NODE_ID__, so without this bootstrap
+                // the host-VM lookup matches nothing and the relay's own DHT/BS VMs
+                // fall through into CGNAT grouping.
+                CONFIG.nodeId = status.node_id ?? CONFIG.nodeId;
             }
         } catch (_) { /* non-fatal — proceed with placeholder values */ }
 
@@ -502,38 +508,29 @@ function renderCGNATNodes() {
  * Removes matched VMs from the systemVmsByParent map.
  */
 function findChildSystemVms(cgnatPeer, systemVmsByParent) {
-    // Try matching by description — orchestrator sets CGNAT node description like
-    // "CGNAT node <name> (<id>)". The system VM's parent_node_id is the node ID.
-    // We scan all remaining groups and check if any parent makes sense.
-    const children = [];
-
-    for (const [parentId, vms] of Object.entries(systemVmsByParent)) {
-        if (!parentId || parentId === 'unknown') continue;
-
-        // Heuristic: CGNAT peer and its system VMs share the same subnet
-        // e.g., CGNAT node at 10.20.1.3 and its DHT VM at 10.20.1.203
-        const cgnatSubnet = extractSubnet(cgnatPeer.allowed_ips);
-        const vmSubnet = vms.length > 0 ? extractSubnet(vms[0].allowed_ips) : null;
-
-        if (cgnatSubnet && vmSubnet && cgnatSubnet === vmSubnet) {
-            children.push(...vms);
-            delete systemVmsByParent[parentId];
-            break;
-        }
+    // PRIMARY: orchestrator-provided parent_node_id on the CGNAT peer
+    // (set in RelayNodeService → /api/relay/add-peer). CGNAT peers carry
+    // their own node ID as parent_node_id; system VMs owned by that node
+    // carry the same value. O(1) lookup, no heuristics.
+    //
+    // FALLBACK: legacy CGNAT peers registered before the orchestrator
+    // started sending parent_node_id have it as null. The description
+    // string "CGNAT node <name> (<uuid>)" still embeds the ID — parse it
+    // out. Relay-api's idempotent fast-path backfills the stored
+    // metadata on the next heartbeat, so this fallback fires at most
+    // once per peer after the upgrade.
+    let cgnatNodeId = cgnatPeer.parent_node_id;
+    if (!cgnatNodeId && cgnatPeer.description) {
+        const m = cgnatPeer.description.match(/\(([0-9a-fA-F-]{36})\)/);
+        if (m) cgnatNodeId = m[1];
     }
+    if (!cgnatNodeId) return [];
 
-    return children;
-}
+    const vms = systemVmsByParent[cgnatNodeId];
+    if (!vms || vms.length === 0) return [];
 
-/**
- * Extract subnet (first 3 octets) from allowed_ips like "10.20.1.3/32"
- */
-function extractSubnet(allowedIps) {
-    if (!allowedIps) return null;
-    const ip = allowedIps.split('/')[0].split(',')[0].trim();
-    const parts = ip.split('.');
-    if (parts.length === 4) return `${parts[0]}.${parts[1]}.${parts[2]}`;
-    return null;
+    delete systemVmsByParent[cgnatNodeId];
+    return vms;
 }
 
 /**

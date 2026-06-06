@@ -41,6 +41,10 @@ RELAY_ID       = _meta.get('relay_id', 'unknown')
 RELAY_NAME     = _meta.get('relay_name', 'relay-unknown')
 RELAY_REGION   = _meta.get('region', 'default')
 RELAY_CAPACITY = int(_meta.get('max_capacity', 10))
+# Host node ID — the relay VM's owning node. Used to group the
+# host's own system VMs separately from CGNAT-node-owned ones on the dashboard.
+# 'unknown' fallback covers very old metadata files written before this field existed.
+NODE_ID        = _meta.get('node_id', 'unknown')
 WIREGUARD_INTERFACE = "wg-relay-server"
 STATIC_DIR = "/opt/decloud-relay/static"
 LISTEN_PORT = 8080
@@ -812,6 +816,7 @@ class RelayAPIHandler(BaseHTTPRequestHandler):
                 pass
             
             self.send_json_response({
+                'node_id': NODE_ID,
                 'relay_id': RELAY_ID,
                 'relay_name': RELAY_NAME,
                 'region': RELAY_REGION,
@@ -951,6 +956,26 @@ class RelayAPIHandler(BaseHTTPRequestHandler):
                 already_tracked = public_key in peer_registration_times
 
             if already_tracked:
+                # Migration-aware backfill: legacy peers that registered before
+                # the orchestrator started sending parent_node_id have it stored
+                # as null. Update once when a real value arrives, then idempotent
+                # fast-path resumes for subsequent heartbeats (one disk write per
+                # peer, total).
+                incoming_parent = data.get('parent_node_id')
+                if incoming_parent:
+                    existing = get_peer_metadata(public_key) or {}
+                    if existing.get('parent_node_id') != incoming_parent:
+                        set_peer_metadata(
+                            public_key,
+                            existing.get('peer_type') or data.get('peer_type', 'cgnat-node'),
+                            incoming_parent,
+                            existing.get('description') or data.get('description', '')
+                        )
+                        logger.info(
+                            f"Backfilled parent_node_id={incoming_parent} "
+                            f"for peer {public_key[:16]}..."
+                        )
+
                 logger.debug(
                     f"⏭️  Idempotent re-add for already-tracked peer {public_key[:16]}... — skipping"
                 )
