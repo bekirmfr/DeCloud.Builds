@@ -3,32 +3,54 @@
 ## Composed onto base-templates/base-tenant.yaml by TemplateComposer.
 ## The base layer owns the platform invariants — hostname, SSH password auth,
 ## chpasswd bootcmd, sshd drop-in, qemu-guest-agent package, the SSH CA, and
-## the orchestrator-url file. This role layer carries ONLY the Coolify
-## workload.
+## the orchestrator-url file. This role layer carries ONLY the Coolify workload.
 ##
 ## Merge behaviour (TemplateComposer):
-##   - write_files / runcmd      → ListConcat (base entries first, role after)
-##   - packages                  → ListUnion
-##   - final_message             → ScalarRoleWins (this layer's value is used)
+##   - write_files / runcmd   → ListConcat (base entries first, role after)
+##   - packages               → ListUnion
+##   - final_message          → ScalarRoleWins
 ##
-## write_files DESIGN NOTE (2026-06-06 incident lesson):
-## Every file written here is owner root:root. cloud-init's write_files runs
-## during the config stage, BEFORE any runcmd has executed and BEFORE any
-## non-default user exists. Declaring owner: <someuser> on a write_files entry
-## whose user is created later (in runcmd) makes cc_write_files raise on the
-## chown and abort the ENTIRE write_files list. Coolify runs as root and its
-## installer owns /data/coolify itself (9999:root), so there is no non-root
-## owner to declare here. Keep it that way.
+## write_files DESIGN NOTES:
+##
+## 1. owner root:root on every entry. cloud-init's write_files runs during the
+##    config stage, before any runcmd, before any non-default user exists.
+##    Declaring a non-existent owner aborts the entire write_files list.
+##
+## 2. No heredocs inside write_files content blocks. A heredoc body at column 0
+##    inside an indented YAML block scalar causes YAML linter errors (the bare
+##    words look like mapping keys). Use printf in scripts; use write_files
+##    entries for files that need to exist before runcmd runs.
 
 write_files:
-  # ── coolify-setup.sh ───────────────────────────────────────────────────
-  # Runs once at first boot via runcmd. Generates a strong admin credential,
-  # persists it for retrieval over SSH, then runs Coolify's official installer
-  # with the root-user env vars so the instance admin is pre-created at boot.
+
+  # ── sshd drop-in: Docker bridge pubkey auth ───────────────────────────────
+  # base-tenant.yaml sets TrustedUserCAKeys + AuthorizedPrincipalsFile (the
+  # DeCloud SSH CA). This blocks plain pubkey auth — keys not signed by the CA
+  # are rejected. Coolify's generated key is not CA-signed, so it would be
+  # locked out of localhost SSH.
   #
-  # Why this is in write_files (not inline in runcmd): the script body uses
-  # its own quoting and a curl|bash pipe; keeping it as a literal block scalar
-  # keeps cloud-init's YAML parser away from the shell syntax.
+  # This Match block exempts 10.0.0.0/8 (any Docker bridge subnet) so Coolify
+  # can connect the moment its containers start. Written here (write_files =
+  # cloud_config_modules stage) so it is on disk before setup.sh reloads sshd.
+  - path: /etc/ssh/sshd_config.d/98-coolify-localhost.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # DeCloud/Coolify: allow plain pubkey auth from Docker bridge subnets.
+      # The DeCloud CA + AuthorizedPrincipalsFile applies to all other connections.
+      Match Address 10.0.0.0/8
+          AuthorizedKeysFile .ssh/authorized_keys
+          AuthorizedPrincipalsFile none
+
+  # ── coolify-setup.sh ──────────────────────────────────────────────────────
+  # Runs once at first boot via runcmd. Generates the admin credential, writes
+  # it to disk, reloads sshd to pick up the drop-in above, then runs the
+  # official Coolify installer with ROOT_USER_* env vars to pre-seed the admin
+  # — closing the "first visitor becomes admin" security race.
+  #
+  # Uses printf (not heredoc) throughout. Heredoc terminators must be flush-left
+  # in bash, but all content here is indented inside a YAML block scalar —
+  # mixing the two causes either YAML parse errors or heredocs that never close.
   - path: /opt/decloud/coolify-setup.sh
     owner: root:root
     permissions: '0755'
@@ -42,66 +64,51 @@ write_files:
       mkdir -p /opt/decloud
 
       # ── Generate the instance admin credential ───────────────────────────
-      # Pre-seeding the root user via env CLOSES the "first visitor becomes
-      # admin" window that Coolify warns about: RootUserSeeder creates this
-      # user at boot, and once it exists the public registration page is
-      # disabled. The credential is generated on the VM and never leaves it —
-      # the operator retrieves it over SSH (see final_message).
-      #
-      # Password is built to satisfy upper/lower/digit/symbol complexity.
-      # NOTE: confirm against Coolify's current validation rules during Gate 4.
+      # admin@coolify.local: plain domain that passes Coolify's email validator.
+      # Hostname-derived .local addresses (e.g. admin@coolify-9c3e.coolify.local)
+      # were rejected by RootUserSeeder, leaving the registration page open.
       ADMIN_USERNAME="admin"
-      ADMIN_EMAIL="admin@coolify.local"   # plain domain — passes Coolify's email validator
+      ADMIN_EMAIL="admin@coolify.local"
       ADMIN_PASSWORD="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9')Aa1#"
 
+      # Write cred file via printf — no heredoc, no indentation ambiguity.
       umask 077
-      cat > "$CRED_FILE" <<EOF
-      DeCloud — Coolify instance admin
-      ================================
-      Dashboard : https://__DECLOUD_DOMAIN__
-      Email     : $ADMIN_EMAIL
-      Username  : $ADMIN_USERNAME
-      Password  : $ADMIN_PASSWORD
+      printf '%s\n' \
+        "DeCloud - Coolify instance admin" \
+        "================================" \
+        "Dashboard : https://__DECLOUD_DOMAIN__" \
+        "Email     : ${ADMIN_EMAIL}" \
+        "Username  : ${ADMIN_USERNAME}" \
+        "Password  : ${ADMIN_PASSWORD}" \
+        "" \
+        "The public registration page is DISABLED - this admin was pre-created" \
+        "at boot. Log in with the credentials above. Change the password from" \
+        "Settings after first login if you wish." \
+        > "${CRED_FILE}"
+      chmod 600 "${CRED_FILE}"
 
-      The public registration page is DISABLED — this admin was pre-created
-      at boot. Log in with the credentials above. Change the password from
-      Settings after first login if you wish.
-      EOF
-      chmod 600 "$CRED_FILE"
-
-      # ── Allow Coolify's plain pubkey from the Docker bridge ─────────────────
-      # base-tenant.yaml sets AuthorizedPrincipalsFile (DeCloud SSH CA) which
-      # blocks plain pubkey auth. Coolify's key is not CA-signed so it would be
-      # rejected. This Match block exempts the Docker bridge (10.0.0.0/8) and
-      # must be in place BEFORE the installer starts Coolify containers.
-      cat > /etc/ssh/sshd_config.d/98-coolify-localhost.conf << 'SSHEOF'
-# DeCloud/Coolify: plain pubkey auth from Docker bridge subnets.
-# DeCloud CA + AuthorizedPrincipalsFile applies to all other connections.
-Match Address 10.0.0.0/8
-    AuthorizedKeysFile .ssh/authorized_keys
-    AuthorizedPrincipalsFile none
-SSHEOF
+      # ── Reload sshd to pick up 98-coolify-localhost.conf ────────────────
+      # The drop-in was written by write_files (runs before runcmd), so it is
+      # already on disk. Reload is sufficient — no restart needed.
       systemctl reload ssh
       log "sshd updated: Docker bridge pubkey auth enabled."
 
       # ── Install Coolify ──────────────────────────────────────────────────
-      # Official installer. Installs Docker Engine 24+, curl/wget/git/jq/
+      # Official one-liner. Installs Docker Engine 24+, curl/wget/git/jq/
       # openssl, sets up /data/coolify, and starts the Coolify containers.
-      # The dashboard listens on :8000 (HTTP). Pulls several images — allow
-      # a few minutes on first boot.
+      # Dashboard listens on :8000 (HTTP). Image pull takes ~2-5 minutes.
       log "Installing Coolify (pulls Docker + Coolify containers; ~2-5 min)..."
-      env ROOT_USERNAME="$ADMIN_USERNAME" \
-          ROOT_USER_EMAIL="$ADMIN_EMAIL" \
-          ROOT_USER_PASSWORD="$ADMIN_PASSWORD" \
+      env ROOT_USERNAME="${ADMIN_USERNAME}" \
+          ROOT_USER_EMAIL="${ADMIN_EMAIL}" \
+          ROOT_USER_PASSWORD="${ADMIN_PASSWORD}" \
           bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
 
       log "Coolify installed. Dashboard on :8000 (routed via CentralIngress)."
-      log "Admin credentials saved to $CRED_FILE"
+      log "Admin credentials saved to ${CRED_FILE}"
 
 runcmd:
   # Start QEMU guest agent (static unit — systemctl enable fails silently on
-  # the cloud image, so symlink directly; mirrors the validated Minecraft
-  # role pattern).
+  # the cloud image, so symlink directly; mirrors the validated Minecraft role).
   - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
   - systemctl start qemu-guest-agent
 
@@ -123,6 +130,5 @@ final_message: |
 
   Then open the dashboard, connect a Git repo, and deploy your first app.
 
-  Tip: in Coolify → Settings, set the Instance Domain to your DeCloud
-  subdomain to enable live deploy-log streaming and to serve your deployed
-  apps with automatic HTTPS.
+  Tip: in Coolify Settings, set the Instance Domain to your DeCloud subdomain
+  to enable live deploy-log streaming and to serve your deployed apps with HTTPS.
