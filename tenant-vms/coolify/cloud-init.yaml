@@ -51,7 +51,7 @@ write_files:
       # Password is built to satisfy upper/lower/digit/symbol complexity.
       # NOTE: confirm against Coolify's current validation rules during Gate 4.
       ADMIN_USERNAME="admin"
-      ADMIN_EMAIL="admin@__HOSTNAME__.coolify.local"
+      ADMIN_EMAIL="admin@coolify.local"   # plain domain — passes Coolify's email validator
       ADMIN_PASSWORD="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9')Aa1#"
 
       umask 077
@@ -68,6 +68,21 @@ write_files:
       Settings after first login if you wish.
       EOF
       chmod 600 "$CRED_FILE"
+
+      # ── Allow Coolify's plain pubkey from the Docker bridge ─────────────────
+      # base-tenant.yaml sets AuthorizedPrincipalsFile (DeCloud SSH CA) which
+      # blocks plain pubkey auth. Coolify's key is not CA-signed so it would be
+      # rejected. This Match block exempts the Docker bridge (10.0.0.0/8) and
+      # must be in place BEFORE the installer starts Coolify containers.
+      cat > /etc/ssh/sshd_config.d/98-coolify-localhost.conf << 'SSHEOF'
+# DeCloud/Coolify: plain pubkey auth from Docker bridge subnets.
+# DeCloud CA + AuthorizedPrincipalsFile applies to all other connections.
+Match Address 10.0.0.0/8
+    AuthorizedKeysFile .ssh/authorized_keys
+    AuthorizedPrincipalsFile none
+SSHEOF
+      systemctl reload ssh
+      log "sshd updated: Docker bridge pubkey auth enabled."
 
       # ── Install Coolify ──────────────────────────────────────────────────
       # Official installer. Installs Docker Engine 24+, curl/wget/git/jq/
