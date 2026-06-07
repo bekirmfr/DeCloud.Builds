@@ -143,21 +143,19 @@ write_files:
       # Run the official Coolify installer.
       # Installs Docker Engine 24+, sets up /data/coolify, pulls and starts
       # all Coolify containers. Dashboard listens on :8000. Allow ~2-5 min.
-      log "Installing Coolify (pulls Docker + Coolify containers; ~2-5 min)..."
-      bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
-
-      # Pre-configure the instance URL to the assigned DeCloud subdomain.
-      # Coolify's APP_URL controls dashboard access, realtime WebSocket origin,
-      # and the wildcard domain for deployed apps. Setting it here avoids the
-      # manual Settings step and bypasses the DNS validation error — which always
-      # fails for DeCloud subdomains because they route via CentralIngress, not
-      # directly to the VM IP, so Coolify's internal DNS check never resolves.
-      log "Configuring instance URL: https://__DECLOUD_DOMAIN__"
-      sed -i 's|^APP_URL=.*|APP_URL=https://__DECLOUD_DOMAIN__|' /data/coolify/source/.env
-      # Restart coolify to apply APP_URL. The coolify-fix-hosts event watcher
-      # re-patches /etc/hosts on the resulting start event automatically.
-      docker restart coolify
-      log "Instance URL configured."
+      #
+      # APP_URL is the single source of truth for dashboard origin, realtime
+      # WebSocket origin (terminal + deploy logs), and the host the Coolify
+      # proxy routes to. Passing it at install time means Coolify boots once
+      # with the correct value — no post-install sed + docker restart cycle.
+      # Coolify reads PUSHER_HOST from APP_URL when blank, so the realtime
+      # WS origin matches the dashboard automatically. Setting APP_URL also
+      # bypasses Coolify's Settings-page DNS check, which always fails for
+      # DeCloud subdomains because they route via CentralIngress rather than
+      # directly to the VM's public IP.
+      log "Installing Coolify (instance URL: https://__DECLOUD_DOMAIN__; ~2-5 min)..."
+      env APP_URL="https://__DECLOUD_DOMAIN__" \
+          bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
 
       log "Coolify installed. Dashboard on :8000 (routed via CentralIngress)."
 
@@ -184,6 +182,11 @@ final_message: |
     1. Create your admin account (email + password of your choice)
     2. Choose "This Machine" as the server type
     3. Connect a Git repo and deploy your first app
+
+  To make a deployed app reachable from the internet:
+    Add a Custom Domain to this VM in the DeCloud dashboard and CNAME it
+    to the platform's base domain. Use the same domain in Coolify's
+    per-app settings — Coolify's Traefik will route it once DNS resolves.
 
   SSH access:
     ssh root@__HOSTNAME__    (password: see your DeCloud VM details)
