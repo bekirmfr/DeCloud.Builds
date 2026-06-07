@@ -138,19 +138,30 @@ write_files:
       # Run the official Coolify installer.
       # Installs Docker Engine 24+, sets up /data/coolify, pulls and starts
       # all Coolify containers. Dashboard listens on :8000. Allow ~2-5 min.
-      #
-      # APP_URL is the single source of truth for dashboard origin, realtime
-      # WebSocket origin (terminal + deploy logs), and the host the Coolify
-      # proxy routes to. Passing it at install time means Coolify boots once
-      # with the correct value — no post-install sed + docker restart cycle.
-      # Coolify reads PUSHER_HOST from APP_URL when blank, so the realtime
-      # WS origin matches the dashboard automatically. Setting APP_URL also
-      # bypasses Coolify's Settings-page DNS check, which always fails for
-      # DeCloud subdomains because they route via CentralIngress rather than
-      # directly to the VM's public IP.
       log "Installing Coolify (instance URL: https://__DECLOUD_DOMAIN__; ~2-5 min)..."
-      env APP_URL="https://__DECLOUD_DOMAIN__" \
-          bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
+      curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
+
+      # ── APP_URL and Reverb WebSocket configuration ────────────────────────
+      # Coolify's install.sh writes /data/coolify/source/.env from a template
+      # that lacks APP_URL, PUSHER_HOST, PUSHER_PORT, PUSHER_SCHEME. With
+      # those empty, Laravel falls back to http://localhost and the browser-
+      # side Pusher client tries wss://localhost:6001 — which is the user's
+      # own machine, not the VM. Livewire components await that handshake
+      # forever and the dashboard renders as a perpetual black loading
+      # screen. Append the right values to .env at the boundary the
+      # installer itself uses, then restart Coolify so the new config takes
+      # effect. sed -e '/^KEY=/d' first makes re-runs idempotent.
+      DECLOUD_DOMAIN="__DECLOUD_DOMAIN__"
+      ENV_FILE="/data/coolify/source/.env"
+      log "Setting APP_URL and Reverb host in ${ENV_FILE}..."
+      sed -i '/^APP_URL=/d;/^PUSHER_HOST=/d;/^PUSHER_PORT=/d;/^PUSHER_SCHEME=/d' "${ENV_FILE}"
+      echo "APP_URL=https://${DECLOUD_DOMAIN}" >> "${ENV_FILE}"
+      echo "PUSHER_HOST=${DECLOUD_DOMAIN}"     >> "${ENV_FILE}"
+      echo "PUSHER_PORT=443"                   >> "${ENV_FILE}"
+      echo "PUSHER_SCHEME=https"               >> "${ENV_FILE}"
+
+      log "Restarting Coolify to apply env changes..."
+      cd /data/coolify/source && docker compose restart coolify coolify-realtime
 
       # Patch the containers the installer just started. The event-driven
       # watcher we arm in the next step only fires on FUTURE container starts
