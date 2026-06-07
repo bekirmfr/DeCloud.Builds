@@ -41,54 +41,126 @@ write_files:
           AuthorizedKeysFile .ssh/authorized_keys
           AuthorizedPrincipalsFile none
 
-  # ── coolify-fix-hosts.sh ──────────────────────────────────────────────────
-  # Patches host.docker.internal in every Coolify container to point at the
-  # Coolify network bridge gateway instead of docker0.
+  # ── coolify-realtime.conf ─────────────────────────────────────────────────
+  # nginx /app/* location block. Proxies Reverb WebSocket traffic from the
+  # dashboard subdomain to the coolify-realtime container on :6001.
   #
   # WHY THIS IS NEEDED:
-  # Docker sets host.docker.internal to the docker0 gateway (10.0.0.1) in ALL
-  # containers, regardless of which network the container is on. Coolify runs
-  # its containers on its own bridge network (gateway 10.0.1.1). Connections
-  # from Coolify containers to 10.0.0.1:22 never reach sshd — silent failure.
+  # Stock Coolify uses two ports — :8000 for the dashboard (nginx + Laravel)
+  # and :6001 for realtime (Reverb, direct). Browsers connect to both. When
+  # CentralIngress fronts Coolify on a single subdomain, both HTTP and WS
+  # must flow through :8000, so nginx has to split /app/* off to Reverb.
+  # Coolify's stock nginx config has no such split — /app/* falls through
+  # to Laravel and 500s on the WS upgrade.
+  #
+  # Dropped into /etc/nginx/server-opts.d/ inside the coolify container by
+  # coolify-fix-hosts.sh on every container start. server-opts.d is included
+  # at server-block scope by both http.conf (after we add the include line
+  # — see coolify-fix-hosts.sh) and https.conf.
+  - path: /opt/decloud/coolify-realtime.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      location /app/ {
+          proxy_pass http://coolify-realtime:6001;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_read_timeout 86400s;
+          proxy_send_timeout 86400s;
+      }
+
+  # ── coolify-fix-hosts.sh ──────────────────────────────────────────────────
+  # Applies in-container patches that don't survive Coolify upgrades. Despite
+  # the historical name, this script now applies TWO patches:
+  #
+  #   1. host.docker.internal — repoint to the Coolify network bridge
+  #      gateway in all four Coolify containers, so they can reach the
+  #      host's sshd on Docker bridge subnets.
+  #
+  #   2. nginx /app/* location — drop coolify-realtime.conf into the
+  #      coolify container's server-opts.d and ensure http.conf includes
+  #      server-opts.d (Coolify's rendered http.conf is missing the include
+  #      that http.conf.template carries). This makes Reverb's WebSocket
+  #      reachable through the dashboard subdomain.
   #
   # WHY NOT A COMPOSE FILE PATCH:
   # Coolify's upgrade.sh re-downloads compose files from CDN before recreating
-  # containers, overwriting any extra_hosts patch. /etc/hosts inside a container
-  # is also reset on every recreation. This script is called by the event-driven
-  # systemd service below, which fires on every Coolify container start.
+  # containers, overwriting any extra_hosts patch. /etc/hosts and the nginx
+  # config inside the container are also reset on every recreation. This
+  # script is called by the event-driven systemd service below, which fires
+  # on every Coolify container start.
   - path: /opt/decloud/coolify-fix-hosts.sh
     owner: root:root
     permissions: '0755'
     content: |
       #!/bin/bash
-      # Patch host.docker.internal in Coolify containers to the correct bridge
-      # gateway. Called by coolify-fix-hosts.service on every container start.
+      # Apply in-container patches to Coolify containers. Called by
+      # coolify-fix-hosts.service on every container start event.
       set -euo pipefail
+
+      log() { echo "[coolify-fix-hosts] $*"; }
 
       CONTAINERS="coolify coolify-db coolify-redis coolify-realtime"
 
+      # ─── Patch 1: host.docker.internal ───────────────────────────────────
       # Get the IPv4 gateway of the Coolify Docker network.
       GW=$(docker network inspect coolify \
           --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null \
           | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
 
       if [ -z "$GW" ]; then
-          echo "[coolify-fix-hosts] Coolify network not found yet, skipping"
+          log "Coolify network not found yet, skipping"
           exit 0
       fi
 
-      echo "[coolify-fix-hosts] Patching host.docker.internal to $GW"
+      log "Patching host.docker.internal to $GW"
 
       for ctr in $CONTAINERS; do
           if docker inspect "$ctr" &>/dev/null; then
               docker exec -u root "$ctr" sh -c \
                   'cat /etc/hosts | sed "s/.*host\.docker\.internal.*/'$GW' host.docker.internal/" > /tmp/h && cat /tmp/h > /etc/hosts' \
-                  && echo "[coolify-fix-hosts] Patched $ctr" \
-                  || echo "[coolify-fix-hosts] Skipped $ctr (exec failed)"
+                  && log "Patched hosts in $ctr" \
+                  || log "Skipped hosts in $ctr (exec failed)"
           fi
       done
 
-      echo "[coolify-fix-hosts] Done."
+      # ─── Patch 2: nginx /app/* WebSocket proxy ───────────────────────────
+      # Only the 'coolify' container runs nginx; the realtime proxy block
+      # lives inside it, but proxies traffic OUT to coolify-realtime:6001.
+      if docker inspect coolify &>/dev/null; then
+          # Copy the location block into nginx server-opts.d.
+          if docker cp /opt/decloud/coolify-realtime.conf \
+              coolify:/etc/nginx/server-opts.d/coolify-realtime.conf 2>/dev/null; then
+              log "Copied coolify-realtime.conf into nginx server-opts.d"
+          else
+              log "Failed to copy coolify-realtime.conf (continuing)"
+          fi
+
+          # Ensure http.conf loads server-opts.d (matches https.conf behaviour).
+          # Idempotent: only appends the include line if not already present.
+          # http.conf.template carries this line; Coolify's rendered http.conf
+          # is missing it, so direct /:8080 traffic doesn't load server-opts.d.
+          docker exec coolify sh -c '
+              grep -q "include /etc/nginx/server-opts.d/" /etc/nginx/site-opts.d/http.conf \
+                  || echo "include /etc/nginx/server-opts.d/*.conf;" >> /etc/nginx/site-opts.d/http.conf
+          ' && log "Ensured server-opts.d include in http.conf"
+
+          # Validate and reload nginx inside the container.
+          if docker exec coolify nginx -t &>/dev/null; then
+              docker exec coolify nginx -s reload \
+                  && log "Reloaded nginx" \
+                  || log "nginx reload failed"
+          else
+              log "nginx -t failed, refusing to reload"
+          fi
+      fi
+
+      log "Done."
 
   # ── coolify-fix-hosts.service ─────────────────────────────────────────────
   # Event-driven systemd service. Watches Docker events and re-patches
@@ -173,11 +245,12 @@ write_files:
       log "Restarting Coolify containers to apply env changes..."
       docker restart coolify coolify-realtime
 
-      # Patch the containers the installer just started. The event-driven
-      # watcher we arm in the next step only fires on FUTURE container starts
-      # (upgrades, manual docker restart). The initial set is already running
-      # with docker0 as host.docker.internal, so patch once explicitly here.
-      log "Patching host.docker.internal in initial Coolify containers..."
+      # Apply in-container patches to the initial Coolify containers. The
+      # event-driven watcher armed in the next step only fires on FUTURE
+      # container start events, so we run the patch script once explicitly
+      # here for the initial set started by the installer (hosts.docker.
+      # internal repoint + nginx /app/* WebSocket proxy + nginx reload).
+      log "Applying in-container patches to initial Coolify containers..."
       /opt/decloud/coolify-fix-hosts.sh
 
       # Arm the event-driven watcher for future container starts. Docker is
