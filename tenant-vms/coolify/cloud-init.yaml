@@ -135,11 +135,6 @@ write_files:
       systemctl reload ssh
       log "sshd updated: Docker bridge pubkey auth enabled."
 
-      # Start the event-driven fix service before the installer so it catches
-      # the very first container start events from the installer itself.
-      systemctl start coolify-fix-hosts.service
-      log "coolify-fix-hosts service started."
-
       # Run the official Coolify installer.
       # Installs Docker Engine 24+, sets up /data/coolify, pulls and starts
       # all Coolify containers. Dashboard listens on :8000. Allow ~2-5 min.
@@ -156,6 +151,20 @@ write_files:
       log "Installing Coolify (instance URL: https://__DECLOUD_DOMAIN__; ~2-5 min)..."
       env APP_URL="https://__DECLOUD_DOMAIN__" \
           bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
+
+      # Patch the containers the installer just started. The event-driven
+      # watcher we arm in the next step only fires on FUTURE container starts
+      # (upgrades, manual docker restart). The initial set is already running
+      # with docker0 as host.docker.internal, so patch once explicitly here.
+      log "Patching host.docker.internal in initial Coolify containers..."
+      /opt/decloud/coolify-fix-hosts.sh
+
+      # Arm the event-driven watcher for future container starts. Docker is
+      # installed and docker.service is registered now, so Requires=docker.service
+      # resolves cleanly. The runcmd-level `systemctl enable` already created
+      # the boot-time symlink, so reboots are also covered.
+      systemctl start coolify-fix-hosts.service
+      log "coolify-fix-hosts service started."
 
       log "Coolify installed. Dashboard on :8000 (routed via CentralIngress)."
 
