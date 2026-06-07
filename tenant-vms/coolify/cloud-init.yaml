@@ -160,8 +160,18 @@ write_files:
       echo "PUSHER_PORT=443"                   >> "${ENV_FILE}"
       echo "PUSHER_SCHEME=https"               >> "${ENV_FILE}"
 
-      log "Restarting Coolify to apply env changes..."
-      cd /data/coolify/source && docker compose restart coolify coolify-realtime
+      # Restart only the containers that need to re-read .env. Laravel reads
+      # .env at process start, so a container restart is sufficient — we are
+      # not changing compose configuration, only application env.
+      #
+      # Use `docker restart` rather than `docker compose restart`: Coolify's
+      # compose file contains a legacy 'soketi' service block kept as a
+      # backward-compatibility alias (container_name: coolify-realtime) with
+      # no image/build/profile. Docker Compose v2 strict validation rejects
+      # this; `docker restart` operates by container name without touching
+      # compose, so it is unaffected.
+      log "Restarting Coolify containers to apply env changes..."
+      docker restart coolify coolify-realtime
 
       # Patch the containers the installer just started. The event-driven
       # watcher we arm in the next step only fires on FUTURE container starts
