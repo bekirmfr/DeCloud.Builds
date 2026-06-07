@@ -68,8 +68,12 @@ write_files:
       # Hostname-derived .local addresses (e.g. admin@coolify-9c3e.coolify.local)
       # were rejected by RootUserSeeder, leaving the registration page open.
       ADMIN_USERNAME="admin"
-      ADMIN_EMAIL="admin@coolify.local"
-      ADMIN_PASSWORD="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9')Aa1#"
+      ADMIN_EMAIL="admin@example.com"
+      # Generate password in two steps: subshell first, suffix second.
+      # Single-expression concatenation fails when openssl runs in a
+      # nested subshell inside printf — the suffix never appends.
+      _RAND="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9')"
+      ADMIN_PASSWORD="${_RAND}Aa1#"
 
       # Write cred file via printf — no heredoc, no indentation ambiguity.
       umask 077
