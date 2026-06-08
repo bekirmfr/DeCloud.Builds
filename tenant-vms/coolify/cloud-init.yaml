@@ -90,7 +90,7 @@ write_files:
           proxy_send_timeout 86400s;
       }
 
-  # ── decloud-traefik-proxy.sh ──────────────────────────────────────────────
+  # ── decloud-traefik-proxy.py ──────────────────────────────────────────────
   # Regenerates Traefik file-provider config for every app container that has
   # a Traefik HTTP host rule. Injects X-Forwarded-Proto: https so apps know
   # they are behind an HTTPS proxy (DeCloud terminates TLS at CentralIngress).
@@ -109,80 +109,103 @@ write_files:
   # overridden from the @file provider. A new router at priority 1000
   # (docker auto-priority is rule-length-based, always lower) wins the
   # routing match before the docker router fires.
-  - path: /opt/decloud/decloud-traefik-proxy.sh
+  - path: /opt/decloud/decloud-traefik-proxy.py
     owner: root:root
     permissions: '0755'
     content: |
-      #!/bin/bash
-      # Regenerate /data/coolify/proxy/dynamic/decloud-custom-domains.yaml
-      # for all running app containers with Traefik HTTP host rules.
-      set -euo pipefail
+      #!/usr/bin/env python3
+      # Regenerate /data/coolify/proxy/dynamic/decloud-custom-domains.yaml for
+      # every running app container that has a Traefik HTTP host router. Adds a
+      # high-priority file-provider router that injects X-Forwarded-Proto: https
+      # and routes straight to the container IP, suppressing both Traefik's
+      # redirect-to-https middleware and the app's own internal HTTPS redirect.
+      #
+      # Pure Python (no shell heredoc) on purpose: cloud-init's write_files
+      # parser treats a column-0 heredoc body inside a block scalar as new YAML
+      # keys and rejects the whole user-data. Building the file in Python keeps
+      # every line cleanly indented under "content: |".
+      import json
+      import re
+      import subprocess
+      import sys
 
-      OUTPUT="/data/coolify/proxy/dynamic/decloud-custom-domains.yaml"
-      TMPFILE="${OUTPUT}.tmp"
-      mkdir -p "$(dirname "$OUTPUT")"
+      OUTPUT = "/data/coolify/proxy/dynamic/decloud-custom-domains.yaml"
+      SKIP = {"coolify", "coolify-db", "coolify-redis", "coolify-realtime", "coolify-proxy"}
+      RULE_RE = re.compile(r"traefik\.http\.routers\.(http-[^.]+)\.rule")
 
-      routers=""
-      services=""
+      def run(args):
+          return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
-      while IFS= read -r cid; do
-          # Skip Coolify infrastructure containers
-          name=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | tr -d '/')
-          echo "$name" | grep -qE '^(coolify|coolify-db|coolify-redis|coolify-realtime|coolify-proxy)$' && continue
+      def main():
+          ids = run(["docker", "ps", "-q"]).split()
+          routers = {}
+          services = {}
+          for cid in ids:
+              raw = run(["docker", "inspect", cid])
+              if not raw:
+                  continue
+              info = json.loads(raw)[0]
+              name = info.get("Name", "").lstrip("/")
+              if name in SKIP:
+                  continue
+              nets = info.get("NetworkSettings", {}).get("Networks", {})
+              ip = next((n.get("IPAddress") for n in nets.values() if n.get("IPAddress")), None)
+              if not ip:
+                  continue
+              labels = info.get("Config", {}).get("Labels") or {}
+              for key, val in labels.items():
+                  m = RULE_RE.match(key)
+                  if not m or "Host(" not in val:
+                      continue
+                  safe = "decloud-" + m.group(1)
+                  routers[safe] = val
+                  services[safe + "-svc"] = ip
 
-          # Get container IP (first network)
-          ip=$(docker inspect --format \
-              '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{break}}{{end}}' \
-              "$cid" 2>/dev/null)
-          [ -z "$ip" ] && continue
+          if not routers:
+              try:
+                  import os
+                  os.remove(OUTPUT)
+              except FileNotFoundError:
+                  pass
+              print("[decloud-traefik-proxy] No app containers found, config removed")
+              return
 
-          # Extract HTTP host rules from Traefik labels
-          docker inspect --format '{{json .Config.Labels}}' "$cid" 2>/dev/null \
-          | python3 -c "
-      import json, sys, re
-      labels = json.load(sys.stdin)
-      for k, v in labels.items():
-          m = re.match(r'traefik\.http\.routers\.(http-[^.]+)\.rule', k)
-          if m and 'Host(' in v:
-              print(m.group(1) + '|' + v)
-      " | while IFS='|' read -r router_name rule; do
-              safe="decloud-${router_name}"
-              routers="${routers}
-    ${safe}:
-      entryPoints: [http]
-      rule: \"${rule}\"
-      service: ${safe}-svc
-      middlewares: [decloud-https-headers]
-      priority: 1000"
-              services="${services}
-    ${safe}-svc:
-      loadBalancer:
-        servers:
-          - url: http://${ip}:80"
-          done
-      done < <(docker ps -q)
+          lines = ["http:", "  routers:"]
+          for safe, rule in routers.items():
+              lines += [
+                  "    " + safe + ":",
+                  "      entryPoints: [http]",
+                  '      rule: "' + rule + '"',
+                  "      service: " + safe + "-svc",
+                  "      middlewares: [decloud-https-headers]",
+                  "      priority: 1000",
+              ]
+          lines += [
+              "  middlewares:",
+              "    decloud-https-headers:",
+              "      headers:",
+              "        customRequestHeaders:",
+              '          X-Forwarded-Proto: "https"',
+              '          X-Forwarded-Ssl: "on"',
+              "  services:",
+          ]
+          for svc, ip in services.items():
+              lines += [
+                  "    " + svc + ":",
+                  "      loadBalancer:",
+                  "        servers:",
+                  "          - url: http://" + ip + ":80",
+              ]
 
-      if [ -z "$routers" ]; then
-          rm -f "$OUTPUT"
-          echo "[decloud-traefik-proxy] No app containers found, config removed"
-          exit 0
-      fi
+          tmp = OUTPUT + ".tmp"
+          with open(tmp, "w") as fh:
+              fh.write("\n".join(lines) + "\n")
+          import os
+          os.replace(tmp, OUTPUT)
+          print("[decloud-traefik-proxy] Config written: %d router(s)" % len(routers))
 
-      cat > "$TMPFILE" << YAML
-      http:
-        routers:
-      ${routers}
-        middlewares:
-          decloud-https-headers:
-            headers:
-              customRequestHeaders:
-                X-Forwarded-Proto: "https"
-                X-Forwarded-Ssl: "on"
-        services:
-      ${services}
-      YAML
-      mv "$TMPFILE" "$OUTPUT"
-      echo "[decloud-traefik-proxy] Config written"
+      if __name__ == "__main__":
+          main()
 
   # ── decloud-traefik-proxy.service ─────────────────────────────────────────
   # Event-driven systemd service. Watches all Docker container start/die
@@ -200,7 +223,7 @@ write_files:
 
       [Service]
       Type=simple
-      ExecStart=/bin/sh -c 'docker events --filter event=start --filter event=die | while read -r line; do /opt/decloud/decloud-traefik-proxy.sh; done'
+      ExecStart=/bin/sh -c 'docker events --filter event=start --filter event=die | while read -r line; do /usr/bin/python3 /opt/decloud/decloud-traefik-proxy.py; done'
       Restart=always
       RestartSec=5
 
@@ -435,7 +458,7 @@ write_files:
       # running, then arm the event watcher for future deploys. At first boot
       # there are no app containers yet, so the script exits cleanly with no
       # output file — that is expected and correct.
-      /opt/decloud/decloud-traefik-proxy.sh || true
+      /usr/bin/python3 /opt/decloud/decloud-traefik-proxy.py || true
       systemctl start decloud-traefik-proxy.service
       log "decloud-traefik-proxy service started."
 
