@@ -132,6 +132,7 @@ write_files:
       OUTPUT = "/data/coolify/proxy/dynamic/decloud-custom-domains.yaml"
       SKIP = {"coolify", "coolify-db", "coolify-redis", "coolify-realtime", "coolify-proxy"}
       RULE_RE = re.compile(r"traefik\.http\.routers\.(http-[^.]+)\.rule")
+      PORT_RE = re.compile(r"traefik\.http\.services\.(http-[^.]+)\.loadbalancer\.server\.port")
 
       def run(args):
           return subprocess.run(args, capture_output=True, text=True).stdout.strip()
@@ -153,13 +154,35 @@ write_files:
               if not ip:
                   continue
               labels = info.get("Config", {}).get("Labels") or {}
+
+              # First pass: collect the upstream port per router from
+              # traefik.http.services.<router>.loadbalancer.server.port.
+              # Coolify always emits this label for each http- router (and the
+              # matching https- one); the docker provider uses it to know where
+              # the app actually listens. We must use the same port, otherwise
+              # the file-provider router proxies to a non-listening port and
+              # Traefik returns 502 Bad Gateway. Default to 80 only if no
+              # label is present, which is unusual for Coolify-deployed apps.
+              router_port = {}
+              for key, val in labels.items():
+                  pm = PORT_RE.match(key)
+                  if pm:
+                      try:
+                          router_port[pm.group(1)] = int(val)
+                      except (TypeError, ValueError):
+                          pass
+
+              # Second pass: build router/service entries, picking the port
+              # from the matching service label (fallback 80).
               for key, val in labels.items():
                   m = RULE_RE.match(key)
                   if not m or "Host(" not in val:
                       continue
-                  safe = "decloud-" + m.group(1)
+                  router_name = m.group(1)
+                  safe = "decloud-" + router_name
+                  port = router_port.get(router_name, 80)
                   routers[safe] = val
-                  services[safe + "-svc"] = ip
+                  services[safe + "-svc"] = (ip, port)
 
           if not routers:
               try:
@@ -189,12 +212,12 @@ write_files:
               '          X-Forwarded-Ssl: "on"',
               "  services:",
           ]
-          for svc, ip in services.items():
+          for svc, (ip, port) in services.items():
               lines += [
                   "    " + svc + ":",
                   "      loadBalancer:",
                   "        servers:",
-                  "          - url: http://" + ip + ":80",
+                  "          - url: http://" + ip + ":" + str(port),
               ]
 
           tmp = OUTPUT + ".tmp"
