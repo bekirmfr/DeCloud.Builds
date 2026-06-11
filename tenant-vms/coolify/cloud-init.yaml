@@ -163,6 +163,19 @@ write_files:
               # the file-provider router proxies to a non-listening port and
               # Traefik returns 502 Bad Gateway. Default to 80 only if no
               # label is present, which is unusual for Coolify-deployed apps.
+              # Port resolution, in order of authority:
+              #   1. traefik.http.services.<router>.loadbalancer.server.port
+              #      label — Coolify emits it for plain domains.
+              #   2. The image's single exposed port (Config.ExposedPorts) —
+              #      Coolify DROPS the server.port label when the domain has a
+              #      path suffix (e.g. https://host/api); Traefik's docker
+              #      provider auto-detects the exposed port in that case, and
+              #      the file provider must replicate that detection.
+              #   3. 80 as last resort.
+              exposed = [p.split("/")[0] for p in (info.get("Config", {}).get("ExposedPorts") or {})
+                         if p.endswith("/tcp")]
+              exposed_port = int(exposed[0]) if len(exposed) == 1 else None
+
               router_port = {}
               for key, val in labels.items():
                   pm = PORT_RE.match(key)
@@ -180,7 +193,7 @@ write_files:
                       continue
                   router_name = m.group(1)
                   safe = "decloud-" + router_name
-                  port = router_port.get(router_name, 80)
+                  port = router_port.get(router_name) or exposed_port or 80
                   routers[safe] = val
                   services[safe + "-svc"] = (ip, port)
 
@@ -195,13 +208,23 @@ write_files:
 
           lines = ["http:", "  routers:"]
           for safe, rule in routers.items():
+              # Priority = 2000 + rule length. Two requirements:
+              #  (a) beat the docker-provider routers, whose default priority
+              #      equals bare rule length (well under 2000), and
+              #  (b) make more specific rules win among OUR routers — with a
+              #      flat priority Traefik's longest-rule tiebreak does not
+              #      reliably apply to explicitly equal priorities, so
+              #      PathPrefix(/api) must outrank PathPrefix(/) by value.
+              #      Encoding rule length into the priority reproduces
+              #      Traefik's native default ordering.
+              prio = 2000 + len(rule)
               lines += [
                   "    " + safe + ":",
                   "      entryPoints: [http]",
                   '      rule: "' + rule + '"',
                   "      service: " + safe + "-svc",
                   "      middlewares: [decloud-https-headers]",
-                  "      priority: 1000",
+                  "      priority: " + str(prio),
               ]
           lines += [
               "  middlewares:",
@@ -512,10 +535,24 @@ final_message: |
     2. Choose "This Machine" as the server type
     3. Connect a Git repo and deploy your first app
 
-  To make a deployed app reachable from the internet:
-    Add a Custom Domain to this VM in the DeCloud dashboard and CNAME it
-    to the platform's base domain. Use the same domain in Coolify's
-    per-app settings — Coolify's Traefik will route it once DNS resolves.
+  To make deployed apps reachable from the internet:
+    Hostnames are yours to choose; ports are handled automatically.
+    Never type an app's internal port anywhere, and ignore the sslip.io
+    URLs Coolify auto-generates — they are not reachable on DeCloud.
+
+    1. DNS (once per app):
+         *.myapp.example.com  CNAME  vms.stackfi.tech   (covers api., files., ...)
+         myapp.example.com    CNAME  vms.stackfi.tech   (wildcard does not cover the bare name)
+    2. DeCloud dashboard → this VM → Custom Domains:
+         add each hostname a browser will visit, target port 80, then Verify.
+         (Port 80 is Coolify's Traefik entrypoint — it routes by hostname
+         to the right container and port from there.)
+    3. Coolify → each service's domain, with NO port suffix:
+         Frontend:  https://myapp.example.com
+         Backend:   https://api.myapp.example.com
+    4. Internal services (databases, caches, server-side object storage)
+       need no domain at all — containers reach them by compose service
+       name (e.g. mysql:3306).
 
   SSH access:
     ssh root@__HOSTNAME__    (password: see your DeCloud VM details)
