@@ -28,13 +28,26 @@ package_update: false
 package_upgrade: false
 
 bootcmd:
-  - rm -f /etc/machine-id /var/lib/dbus/machine-id
-  - systemd-machine-id-setup
+  # Regenerate machine-id ONCE per clone (first boot only), not every boot.
+  # Intent is clone-uniqueness — two VMs cloned from the same base image must
+  # not share a machine-id, or systemd-networkd derives the same DHCP client-id
+  # and they collide. bootcmd runs on EVERY boot, so doing this unconditionally
+  # also rotated the DHCP identity and forced first-boot semantics on every
+  # reboot, destabilizing the early-boot window. The marker makes it run on the
+  # clone's first boot only; the id then stays stable across reboots — and
+  # across migration, where the reconstructed disk carries the marker, which
+  # correctly preserves the VM's identity.
+  - sh -c '[ -e /etc/decloud/.machine-id-initialized ] || { rm -f /etc/machine-id /var/lib/dbus/machine-id; systemd-machine-id-setup; mkdir -p /etc/decloud && touch /etc/decloud/.machine-id-initialized; }'
   # Mask snapd/LXD — unused in system VMs, adds ~50s boot delay.
   - systemctl mask snapd.service snapd.socket snapd.seeded.service snap.lxd.activate.service lxd.service lxd-agent.service 2>/dev/null || true
-  # Start guest agent as early as possible so the orchestrator's readiness
-  # monitor can track cloud-init progress before packages install.
-  - systemctl start qemu-guest-agent 2>/dev/null || true
+  # NOTE: Do NOT start qemu-guest-agent here. bootcmd runs before systemd,
+  # D-Bus, and udev are ready, so an early `systemctl start` is futile — the
+  # unit's ConditionPathExists=/dev/virtio-ports/org.qemu.guest_agent.0 can't be
+  # satisfied yet and systemd will not retry — and it only adds a racing start
+  # attempt that destabilizes agent startup. The qemu-guest-agent package's udev
+  # rule (device appears → SYSTEMD_WANTS) together with the
+  # multi-user.target.wants symlink added in runcmd start the agent reliably at
+  # the right moment. This mirrors the migration-path fix — keep it removed.
 
 # System VMs run as root; no separate user. SSH password auth is disabled —
 # operators connect via SSH certificate authority only.
