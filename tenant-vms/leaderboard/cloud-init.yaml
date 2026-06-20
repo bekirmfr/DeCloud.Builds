@@ -1,0 +1,620 @@
+#cloud-config
+
+# DeCloud Leaderboard Role Layer
+#
+# Composed with base-templates/base-tenant.yaml by TemplateComposer at seed time
+# to form the `leaderboard` VmTemplate. base-tenant owns the platform invariants
+# (hostname, root password, SSH password auth, sshd CA, qemu-guest-agent,
+# curl/jq/openssl, orchestrator-url file, final_message). This layer carries ONLY
+# the leaderboard workload. NOT deployed standalone.
+#
+# Delivery follows the compose-tenant convention (ai-chatbot / minecraft / coolify):
+# the authored service script is embedded inline in write_files — NOT fetched as a
+# DeCloud artifact. Third-party installers would be curl'd from upstream; this
+# service is ours, so it ships in the layer.
+#
+# Substitution:
+#   __VARNAME__   render-time, declared in TemplateSeederService.BuildLeaderboardVariables()
+#   ${VAR}       bash runtime expansion inside scripts (NOT render-time)
+# The Python service uses os.environ only — no render-time tokens inside it.
+#
+# YAML rule (compose convention): no column-0 heredocs in runcmd; static file
+# content lives in write_files.
+
+# python3 may need an apt refresh. base-tenant declares neither package_update nor
+# package_upgrade, so this is role-exclusive (TemplateComposer ScalarExclusive).
+package_update: true
+
+packages:
+  # qemu-guest-agent, curl, jq, openssl come from base-tenant (ListUnion dedupes).
+  - python3
+
+write_files:
+  # The leaderboard service (Python stdlib: http.server + sqlite3). Embedded inline,
+  # same as minecraft's setup.sh / coolify's nginx confs. Read os.environ at runtime.
+  - path: /opt/leaderboard/leaderboard-api.py
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      """
+      DeCloud Generic Leaderboard Service (Python stdlib).
+
+      Shipped the relay way: a single self-contained script delivered as an inline
+      data: URI Script artifact, fetched from the node-local artifact cache and run
+      under systemd as `python3 leaderboard.py`. No compiler, no module fetch, no
+      build step. Standard library only (http.server, sqlite3, json, hmac, secrets).
+
+      Config comes from the environment (set by the systemd unit's EnvironmentFile);
+      this script is NOT processed by cloud-init variable substitution.
+
+      TRUST BOUNDARY (read before deploying):
+        - OPERATOR (deploy password -> ADMIN_TOKEN) mints/revokes apps.
+        - An APP secret authenticates writes + board management for that app only.
+        - PUBLIC reads need only the opaque board key.
+        - This service authenticates the DEPLOYER'S SERVER, not end users. member_id
+          and name are whatever the caller passes. Verifying a portal player token
+          (CrazyGames/Poki/Yandex/etc.) is the deployer's backend's job. The service
+          guarantees authenticated, persisted, and ranked — never that a submitted
+          score is legitimate. Anti-cheat lives in the game layer. Submit from your
+          server, not directly from an untrusted game client.
+      """
+
+      import hashlib
+      import hmac
+      import json
+      import os
+      import re
+      import secrets
+      import sqlite3
+      import time
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+      from urllib.parse import urlparse, parse_qs
+
+      # ── Limits (named, not magic — tune in one place) ───────────────────────────
+      MAX_BODY_BYTES = 16 * 1024          # a score submission is tiny
+      MAX_MEMBER_ID_LEN = 128
+      MAX_METADATA_BYTES = 1024
+      MAX_BOARD_NAME_LEN = 128
+      MAX_APP_LABEL_LEN = 128
+      MAX_LIST_COUNT = 100
+      DEFAULT_LIST_COUNT = 10
+      MAX_AROUND = 50
+      TOKEN_BYTES = 32                    # 256-bit secrets
+
+      PORT = int(os.environ.get("PORT", "8080"))
+      DB_PATH = os.environ.get("DB_PATH", "/var/lib/leaderboard/leaderboard.db")
+      ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+
+      # ── Storage ─────────────────────────────────────────────────────────────────
+
+      def connect():
+          # Connection per request: cheap for SQLite, avoids cross-thread sharing.
+          # WAL + busy_timeout let concurrent readers and one writer coexist without
+          # us inventing our own locking — align to SQLite's own boundary.
+          conn = sqlite3.connect(DB_PATH, timeout=5.0)
+          conn.row_factory = sqlite3.Row
+          conn.execute("PRAGMA journal_mode=WAL")
+          conn.execute("PRAGMA foreign_keys=ON")
+          conn.execute("PRAGMA busy_timeout=5000")
+          return conn
+
+
+      def init_db():
+          with connect() as conn:
+              conn.executescript(
+                  """
+                  CREATE TABLE IF NOT EXISTS apps (
+                    app_id      TEXT PRIMARY KEY,
+                    secret_hash TEXT NOT NULL,
+                    label       TEXT NOT NULL DEFAULT '',
+                    created_at  INTEGER NOT NULL,
+                    revoked_at  INTEGER
+                  );
+                  CREATE TABLE IF NOT EXISTS boards (
+                    board_key                 TEXT PRIMARY KEY,
+                    app_id                    TEXT NOT NULL REFERENCES apps(app_id) ON DELETE CASCADE,
+                    name                      TEXT NOT NULL DEFAULT '',
+                    direction_method          TEXT NOT NULL DEFAULT 'descending',
+                    overwrite_score_on_submit INTEGER NOT NULL DEFAULT 0,
+                    created_at                INTEGER NOT NULL
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_boards_app ON boards(app_id);
+                  CREATE TABLE IF NOT EXISTS scores (
+                    board_key  TEXT NOT NULL REFERENCES boards(board_key) ON DELETE CASCADE,
+                    member_id  TEXT NOT NULL,
+                    score      INTEGER NOT NULL,
+                    metadata   TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (board_key, member_id)
+                  );
+                  CREATE INDEX IF NOT EXISTS idx_scores_rank
+                    ON scores(board_key, score, updated_at, member_id);
+                  """
+              )
+
+
+      # ── Small helpers ─────────────────────────────────────────────────────────
+
+      def now_ms():
+          return int(time.time() * 1000)
+
+
+      def new_token(nbytes):
+          return secrets.token_hex(nbytes)
+
+
+      def hash_token(t):
+          return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+      def ct_equal(a, b):
+          return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+      def clamp(v, lo, hi):
+          return lo if v < lo else hi if v > hi else v
+
+
+      def ranked_cte(direction):
+          # direction is validated to one of two literals before reaching here, so the
+          # interpolation is injection-safe. One deterministic total order for every
+          # read: score (per direction), earliest-to-reach-it, then member_id.
+          score_order = "ASC" if direction == "ascending" else "DESC"
+          return (
+              "WITH ranked AS ("
+              " SELECT member_id, score, metadata,"
+              f" ROW_NUMBER() OVER (ORDER BY score {score_order}, updated_at ASC, member_id ASC) AS rank"
+              " FROM scores WHERE board_key = ?"
+              ") "
+          )
+
+
+      def member_entry(conn, board_key, direction, member_id):
+          row = conn.execute(
+              ranked_cte(direction)
+              + "SELECT rank, member_id, score, metadata FROM ranked WHERE member_id = ?",
+              (board_key, member_id),
+          ).fetchone()
+          if row is None:
+              return None
+          return {
+              "rank": row["rank"],
+              "member_id": row["member_id"],
+              "score": row["score"],
+              "metadata": row["metadata"],
+          }
+
+
+      # ── Request handler ─────────────────────────────────────────────────────────
+
+      class Handler(BaseHTTPRequestHandler):
+          server_version = "DeCloudLeaderboard/1.0"
+
+          # Routes: (method, compiled-regex, handler-name, auth-level)
+          ROUTES = []  # populated after class definition
+
+          # — response helpers —
+          def _json(self, code, obj):
+              body = json.dumps(obj).encode("utf-8")
+              self.send_response(code)
+              self.send_header("Content-Type", "application/json")
+              self.send_header("Content-Length", str(len(body)))
+              self.send_header("X-Content-Type-Options", "nosniff")
+              self.send_header("Referrer-Policy", "no-referrer")
+              self.end_headers()
+              if self.command != "HEAD":
+                  self.wfile.write(body)
+
+          def _err(self, code, msg):
+              self._json(code, {"error": msg})
+
+          def _read_json(self):
+              length = int(self.headers.get("Content-Length", "0") or "0")
+              if length > MAX_BODY_BYTES:
+                  self._err(413, "request body too large")
+                  return None
+              raw = self.rfile.read(length) if length else b""
+              if not raw:
+                  return {}
+              try:
+                  obj = json.loads(raw)
+                  if not isinstance(obj, dict):
+                      raise ValueError
+                  return obj
+              except (ValueError, json.JSONDecodeError):
+                  self._err(400, "invalid JSON body")
+                  return None
+
+          # — auth —
+          def _bearer(self):
+              # x-session-token (LootLocker convention), then x-admin-token, then Bearer.
+              t = self.headers.get("x-session-token")
+              if t:
+                  return t
+              t = self.headers.get("x-admin-token")
+              if t:
+                  return t
+              a = self.headers.get("Authorization", "")
+              if a.startswith("Bearer "):
+                  return a[len("Bearer "):]
+              return ""
+
+          def _resolve_app(self, conn):
+              secret = self._bearer()
+              if not secret:
+                  return None
+              row = conn.execute(
+                  "SELECT app_id FROM apps WHERE secret_hash = ? AND revoked_at IS NULL",
+                  (hash_token(secret),),
+              ).fetchone()
+              return row["app_id"] if row else None
+
+          # — board lookup + the multi-tenant isolation invariant —
+          def _lookup_board(self, conn, key):
+              return conn.execute(
+                  "SELECT board_key, app_id, direction_method, overwrite_score_on_submit"
+                  " FROM boards WHERE board_key = ?",
+                  (key,),
+              ).fetchone()
+
+          def _owned_board(self, conn, key, app_id):
+              # Must exist AND belong to the authenticated app. A board owned by another
+              # app is a 404 — we do not reveal that the key exists.
+              b = self._lookup_board(conn, key)
+              if b is None or b["app_id"] != app_id:
+                  return None
+              return b
+
+          # — dispatch —
+          def _dispatch(self, method):
+              parsed = urlparse(self.path)
+              path = parsed.path
+              qs = parse_qs(parsed.query)
+              for m, rx, name, auth in Handler.ROUTES:
+                  if m != method:
+                      continue
+                  match = rx.match(path)
+                  if not match:
+                      continue
+                  try:
+                      with connect() as conn:
+                          if auth == "admin":
+                              if not ADMIN_TOKEN or not ct_equal(self._bearer(), ADMIN_TOKEN):
+                                  return self._err(401, "invalid admin token")
+                              return getattr(self, name)(conn, match, qs)
+                          if auth == "app":
+                              app_id = self._resolve_app(conn)
+                              if not app_id:
+                                  return self._err(401, "invalid app token")
+                              return getattr(self, name)(conn, match, qs, app_id)
+                          return getattr(self, name)(conn, match, qs)
+                  except Exception:  # noqa: BLE001 — never leak internals to the client
+                      return self._err(500, "internal error")
+              self._err(404, "not found")
+
+          def do_GET(self):
+              self._dispatch("GET")
+
+          def do_POST(self):
+              self._dispatch("POST")
+
+          def do_DELETE(self):
+              self._dispatch("DELETE")
+
+          def log_message(self, fmt, *args):
+              # Journald captures stderr; keep a terse access line, no bodies/secrets.
+              pass
+
+          # ── Health ──────────────────────────────────────────────────────────────
+          def h_health(self, conn, match, qs):
+              conn.execute("SELECT 1")
+              self._json(200, {"status": "ok"})
+
+          # ── Operator handlers ─────────────────────────────────────────────────
+          def h_create_app(self, conn, match, qs):
+              body = self._read_json()
+              if body is None:
+                  return
+              label = str(body.get("label", ""))
+              if len(label) > MAX_APP_LABEL_LEN:
+                  return self._err(400, "label too long")
+              app_id = "app_" + new_token(8)
+              secret = "sk_" + new_token(TOKEN_BYTES)
+              conn.execute(
+                  "INSERT INTO apps(app_id, secret_hash, label, created_at) VALUES(?,?,?,?)",
+                  (app_id, hash_token(secret), label, now_ms()),
+              )
+              # Secret is shown exactly once.
+              self._json(201, {
+                  "app_id": app_id,
+                  "app_secret": secret,
+                  "label": label,
+                  "note": "Store app_secret now — it is not retrievable later.",
+              })
+
+          def h_list_apps(self, conn, match, qs):
+              rows = conn.execute(
+                  "SELECT app_id, label, created_at, revoked_at FROM apps ORDER BY created_at"
+              ).fetchall()
+              apps = [{
+                  "app_id": r["app_id"],
+                  "label": r["label"],
+                  "created_at": r["created_at"],
+                  "revoked": r["revoked_at"] is not None,
+              } for r in rows]
+              self._json(200, {"apps": apps})
+
+          def h_revoke_app(self, conn, match, qs):
+              app_id = match.group("app_id")
+              cur = conn.execute(
+                  "UPDATE apps SET revoked_at = ? WHERE app_id = ? AND revoked_at IS NULL",
+                  (now_ms(), app_id),
+              )
+              if cur.rowcount == 0:
+                  return self._err(404, "app not found or already revoked")
+              self._json(204, {})
+
+          # ── App handlers (scope-checked to the owning app) ─────────────────────
+          def h_create_board(self, conn, match, qs, app_id):
+              body = self._read_json()
+              if body is None:
+                  return
+              name = str(body.get("name", ""))
+              if len(name) > MAX_BOARD_NAME_LEN:
+                  return self._err(400, "name too long")
+              direction = str(body.get("direction_method", "") or "descending").strip().lower()
+              if direction not in ("ascending", "descending"):
+                  return self._err(400, "direction_method must be 'ascending' or 'descending'")
+              overwrite = 1 if body.get("overwrite_score_on_submit") else 0
+              key = "lb_" + new_token(12)
+              conn.execute(
+                  "INSERT INTO boards(board_key, app_id, name, direction_method,"
+                  " overwrite_score_on_submit, created_at) VALUES(?,?,?,?,?,?)",
+                  (key, app_id, name, direction, overwrite, now_ms()),
+              )
+              self._json(201, {
+                  "key": key,
+                  "name": name,
+                  "direction_method": direction,
+                  "overwrite_score_on_submit": bool(overwrite),
+              })
+
+          def h_delete_board(self, conn, match, qs, app_id):
+              b = self._owned_board(conn, match.group("key"), app_id)
+              if b is None:
+                  return self._err(404, "board not found")
+              conn.execute("DELETE FROM boards WHERE board_key = ?", (b["board_key"],))
+              self._json(204, {})
+
+          def h_submit(self, conn, match, qs, app_id):
+              b = self._owned_board(conn, match.group("key"), app_id)
+              if b is None:
+                  return self._err(404, "board not found")
+              body = self._read_json()
+              if body is None:
+                  return
+              member_id = str(body.get("member_id", "")).strip()
+              if not member_id or len(member_id) > MAX_MEMBER_ID_LEN:
+                  return self._err(400, "member_id required, max 128 chars")
+              if not isinstance(body.get("score"), int) or isinstance(body.get("score"), bool):
+                  return self._err(400, "score must be an integer")
+              score = body["score"]
+              metadata = str(body.get("metadata", ""))
+              if len(metadata.encode("utf-8")) > MAX_METADATA_BYTES:
+                  return self._err(400, "metadata too long")
+
+              key = b["board_key"]
+              # Upsert-on-improve unless the board overwrites unconditionally. The WHERE
+              # on the conflict path leaves the existing row untouched when the new score
+              # does not beat it — just the comparison the board declares, no extra gate.
+              base = (
+                  "INSERT INTO scores(board_key, member_id, score, metadata, updated_at)"
+                  " VALUES(?,?,?,?,?)"
+                  " ON CONFLICT(board_key, member_id) DO UPDATE SET"
+                  " score=excluded.score, metadata=excluded.metadata, updated_at=excluded.updated_at"
+              )
+              if b["overwrite_score_on_submit"]:
+                  sql = base
+              elif b["direction_method"] == "descending":
+                  sql = base + " WHERE excluded.score > scores.score"
+              else:  # ascending: lower is better
+                  sql = base + " WHERE excluded.score < scores.score"
+              conn.execute(sql, (key, member_id, score, metadata, now_ms()))
+
+              # Return the member's authoritative current standing (not the value just
+              # submitted, which keep-best may have rejected).
+              entry = member_entry(conn, key, b["direction_method"], member_id)
+              self._json(200, entry or {})
+
+          def h_delete_member(self, conn, match, qs, app_id):
+              b = self._owned_board(conn, match.group("key"), app_id)
+              if b is None:
+                  return self._err(404, "board not found")
+              cur = conn.execute(
+                  "DELETE FROM scores WHERE board_key = ? AND member_id = ?",
+                  (b["board_key"], match.group("member_id")),
+              )
+              if cur.rowcount == 0:
+                  return self._err(404, "member not found")
+              self._json(204, {})
+
+          # ── Public read handlers (board key is the read capability) ────────────
+          def h_list(self, conn, match, qs):
+              b = self._lookup_board(conn, match.group("key"))
+              if b is None:
+                  return self._err(404, "board not found")
+              count = clamp(_qint(qs, "count", DEFAULT_LIST_COUNT), 1, MAX_LIST_COUNT)
+              after = _qint(qs, "after", 0)  # cursor = last seen rank; 0 = start
+              direction = b["direction_method"]
+              rows = conn.execute(
+                  ranked_cte(direction)
+                  + "SELECT rank, member_id, score, metadata FROM ranked"
+                  " WHERE rank > ? ORDER BY rank LIMIT ?",
+                  (b["board_key"], after, count + 1),  # one extra to detect "more"
+              ).fetchall()
+              items = [_entry(r) for r in rows]
+              total = conn.execute(
+                  "SELECT COUNT(*) AS n FROM scores WHERE board_key = ?", (b["board_key"],)
+              ).fetchone()["n"]
+              next_cursor = None
+              if len(items) > count:
+                  next_cursor = items[count - 1]["rank"]
+                  items = items[:count]
+              self._json(200, {
+                  "items": items,
+                  "pagination": {
+                      "total": total,
+                      "next_cursor": next_cursor,
+                      "previous_cursor": after if after > 0 else None,
+                  },
+              })
+
+          def h_member(self, conn, match, qs):
+              b = self._lookup_board(conn, match.group("key"))
+              if b is None:
+                  return self._err(404, "board not found")
+              member_id = match.group("member_id")
+              around = clamp(_qint(qs, "around", 0), 0, MAX_AROUND)
+              direction = b["direction_method"]
+              me = member_entry(conn, b["board_key"], direction, member_id)
+              if me is None:
+                  return self._err(404, "member not on this board")
+              if around == 0:
+                  return self._json(200, me)
+              lo, hi = me["rank"] - around, me["rank"] + around
+              rows = conn.execute(
+                  ranked_cte(direction)
+                  + "SELECT rank, member_id, score, metadata FROM ranked"
+                  " WHERE rank BETWEEN ? AND ? ORDER BY rank",
+                  (b["board_key"], lo, hi),
+              ).fetchall()
+              self._json(200, {"member_id": member_id, "items": [_entry(r) for r in rows]})
+
+
+      def _entry(row):
+          return {
+              "rank": row["rank"],
+              "member_id": row["member_id"],
+              "score": row["score"],
+              "metadata": row["metadata"],
+          }
+
+
+      def _qint(qs, key, default):
+          vals = qs.get(key)
+          if not vals:
+              return default
+          try:
+              return int(vals[0])
+          except (ValueError, TypeError):
+              return default
+
+
+      # Route table — compiled once. {param} segments become named groups.
+      Handler.ROUTES = [
+          ("GET", re.compile(r"^/health$"), "h_health", "public"),
+          # Operator
+          ("POST", re.compile(r"^/admin/apps$"), "h_create_app", "admin"),
+          ("GET", re.compile(r"^/admin/apps$"), "h_list_apps", "admin"),
+          ("DELETE", re.compile(r"^/admin/apps/(?P<app_id>[^/]+)$"), "h_revoke_app", "admin"),
+          # App
+          ("POST", re.compile(r"^/leaderboards$"), "h_create_board", "app"),
+          ("DELETE", re.compile(r"^/leaderboards/(?P<key>[^/]+)$"), "h_delete_board", "app"),
+          ("POST", re.compile(r"^/leaderboards/(?P<key>[^/]+)/submit$"), "h_submit", "app"),
+          ("DELETE", re.compile(r"^/leaderboards/(?P<key>[^/]+)/members/(?P<member_id>[^/]+)$"),
+           "h_delete_member", "app"),
+          # Public
+          ("GET", re.compile(r"^/leaderboards/(?P<key>[^/]+)/list$"), "h_list", "public"),
+          ("GET", re.compile(r"^/leaderboards/(?P<key>[^/]+)/member/(?P<member_id>[^/]+)$"),
+           "h_member", "public"),
+      ]
+
+
+      def main():
+          if not ADMIN_TOKEN:
+              raise SystemExit("ADMIN_TOKEN is required (set by the systemd unit from the deploy password)")
+          os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+          init_db()
+          httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+          print(f"leaderboard listening on :{PORT} (db={DB_PATH})", flush=True)
+          try:
+              httpd.serve_forever()
+          except KeyboardInterrupt:
+              httpd.shutdown()
+
+
+      if __name__ == "__main__":
+          main()
+
+
+  # Service config. ADMIN_TOKEN is the deploy root password (base-tenant also sets
+  # it from __ADMIN_PASSWORD__). systemd reads EnvironmentFile as root before
+  # dropping to User=leaderboard, so 0640 root:root is readable by the service.
+  - path: /etc/leaderboard/leaderboard.env
+    owner: root:root
+    permissions: '0640'
+    content: |
+      PORT=8080
+      DB_PATH=/var/lib/leaderboard/leaderboard.db
+      ADMIN_TOKEN=__ADMIN_PASSWORD__
+
+  - path: /etc/systemd/system/leaderboard.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud Leaderboard Service
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=leaderboard
+      Group=leaderboard
+      EnvironmentFile=/etc/leaderboard/leaderboard.env
+      WorkingDirectory=/opt/leaderboard
+      ExecStart=/usr/bin/python3 /opt/leaderboard/leaderboard-api.py
+      Restart=always
+      RestartSec=5
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ProtectHome=true
+      PrivateTmp=true
+      ReadWritePaths=/var/lib/leaderboard
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/motd
+    owner: root:root
+    permissions: '0644'
+    content: |
+      DeCloud Leaderboard Service
+      ===========================
+      Base URL : https://__DECLOUD_DOMAIN__
+      Admin    : send the deploy password as  x-admin-token  (mint/revoke apps)
+      Health   : https://__DECLOUD_DOMAIN__/health
+
+      Mint an app (server-side):
+        curl -s https://__DECLOUD_DOMAIN__/admin/apps           -H "x-admin-token: __ADMIN_PASSWORD__"           -d '{"label":"my-game"}'
+      Then create a board with the returned app_secret and submit scores to
+        /leaderboards/<KEY>/submit   (header  x-session-token: <APP_SECRET>)
+      Public reads (board key only):
+        /leaderboards/<KEY>/list?count=10
+        /leaderboards/<KEY>/member/<MEMBER>?around=3
+
+runcmd:
+  # Dedicated unprivileged service account (created before the service starts).
+  - id -u leaderboard >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin leaderboard
+  - mkdir -p /var/lib/leaderboard
+  - chown -R leaderboard:leaderboard /var/lib/leaderboard
+  - chmod 0750 /var/lib/leaderboard
+  # Static unit: systemctl enable is unreliable on Debian (base-tenant uses the
+  # same direct-symlink pattern for qemu-guest-agent), so symlink + start.
+  - systemctl daemon-reload
+  - ln -sf /etc/systemd/system/leaderboard.service /etc/systemd/system/multi-user.target.wants/leaderboard.service
+  - systemctl start leaderboard
