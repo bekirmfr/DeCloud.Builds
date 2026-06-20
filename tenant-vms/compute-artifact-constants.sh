@@ -4,7 +4,7 @@
 #
 # Auto-discovers every {role}/assets/ directory under tenant-vms/,
 # computes SHA256 + data: URI for each file, and outputs a compilable
-# C# partial-class file that extends GeneralVmTemplateSeeder with
+# C# partial-class file that extends TenantVmTemplateSeeder with
 # inline artifact constants.
 #
 # The output file is a complete compilation unit — the script auto-copies
@@ -23,10 +23,10 @@
 #   bash compute-artifact-constants.sh
 #
 # Output:
-#   GeneralVmTemplateSeeder.Artifacts.cs  (local, then auto-copied to Orchestrator)
+#   TenantVmTemplateSeeder.Artifacts.cs  (local, then auto-copied to Orchestrator)
 #
 # Auto-copy target (sibling repo):
-#   ../DeCloud.Orchestrator/src/Orchestrator/Services/TemplateConstants/GeneralVmTemplateSeeder.Artifacts.cs
+#   ../DeCloud.Orchestrator/src/Orchestrator/Services/TemplateConstants/TenantVmTemplateSeeder.Artifacts.cs
 #
 # Naming convention  —  {RolePrefix}{FileStem}{ExtSuffix}
 #
@@ -62,7 +62,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT="${SCRIPT_DIR}/GeneralVmTemplateSeeder.Artifacts.cs"
+OUTPUT="${SCRIPT_DIR}/TenantVmTemplateSeeder.Artifacts.cs"
 
 # ── Auto-copy target ─────────────────────────────────────────────────────────
 # Sibling repo layout:  source/repos/DeCloud.Builds/tenant-vms/  (this script)
@@ -72,7 +72,7 @@ TARGET_DIR="${SCRIPT_DIR}/../../DeCloud.Orchestrator/src/Orchestrator/Services/T
 
 # ── C# partial class coordinates ─────────────────────────────────────────────
 CS_NAMESPACE="Orchestrator.Services.Tenant"
-CS_CLASS="GeneralVmTemplateSeeder"
+CS_CLASS="TenantVmTemplateSeeder"
 
 # ── Pure functions ────────────────────────────────────────────────────────────
 
