@@ -74,17 +74,29 @@ write_files:
     content: |
       DeCloud Leaderboard Service
       ===========================
-      Base URL : https://__DECLOUD_DOMAIN__
-      Admin    : send the deploy password as  x-admin-token  (mint/revoke apps)
-      Health   : https://__DECLOUD_DOMAIN__/health
+      Admin console : https://__DECLOUD_DOMAIN__/   (sign in with this VM's root password)
+      Base URL      : https://__DECLOUD_DOMAIN__
+      Health        : https://__DECLOUD_DOMAIN__/health
 
-      Mint an app (server-side):
-        curl -s https://__DECLOUD_DOMAIN__/admin/apps \
+      The console (open the URL above) manages boards, apps, and access keys in
+      the browser. The same admin actions work over curl by sending the deploy
+      password as x-admin-token. The model: boards are project-wide (operator
+      creates them); an app is just a label; an access KEY is a secret bound to
+      one board with the rights you grant (submit, optionally member:delete).
+        # 1) create a board (returns its board key)
+        curl -s https://__DECLOUD_DOMAIN__/admin/boards \
           -H "x-admin-token: __ADMIN_PASSWORD__" \
-          -d '{"label":"my-game"}'
-      Then create a board with the returned app_secret and submit scores to
-        /leaderboards/<KEY>/submit   (header  x-session-token: <APP_SECRET>)
-      Public reads (board key only):
+          -d '{"name":"Daily","direction_method":"descending"}'
+        # 2) create an app (label only, no secret)
+        curl -s https://__DECLOUD_DOMAIN__/admin/apps \
+          -H "x-admin-token: __ADMIN_PASSWORD__" -d '{"label":"my-game"}'
+        # 3) issue a key for that board under the app (scopes default to submit)
+        curl -s https://__DECLOUD_DOMAIN__/admin/apps/<APP_ID>/keys \
+          -H "x-admin-token: __ADMIN_PASSWORD__" \
+          -d '{"board_key":"<KEY>","scopes":["submit"]}'
+      Submit scores from your server with the key secret:
+        /leaderboards/<KEY>/submit   (header  x-session-token: <KEY_SECRET>)
+      Public reads (board key only, no auth):
         /leaderboards/<KEY>/list?count=10
         /leaderboards/<KEY>/member/<MEMBER>?around=3
 
