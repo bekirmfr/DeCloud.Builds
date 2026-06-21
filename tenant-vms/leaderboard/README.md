@@ -101,7 +101,7 @@ GET    /admin/apps
 DELETE /admin/apps/{app_id}
 GET    /admin/boards
 POST   /admin/boards                       {"name","direction_method","write_policy","allow_public_submit"}
-PATCH  /admin/boards/{key}                  {"allow_public_submit": true|false}   (toggle CORS mode)
+PATCH  /admin/boards/{key}                  {"write_policy"?, "allow_public_submit"?}   (change either later)
 DELETE /admin/boards/{key}
 DELETE /admin/boards/{key}/members/{member_id}
 PUT    /admin/boards/{key}/members/{member_id}   {"score","metadata"}   (operator set/correct; bypasses keep-best)
@@ -134,6 +134,12 @@ Each board declares whether browsers may submit, via `allow_public_submit`
 Toggle a board between modes without losing scores via
 `PATCH /admin/boards/{key}`. Public reads are always cross-origin; `member:delete`,
 admin, and key endpoints are never browser-accessible on either mode.
+
+Changing a board's `write_policy` or `allow_public_submit` later (via `PATCH`) is
+safe: both govern only future submissions and never rewrite stored scores or
+ranks. Switching *to* `first` locks each existing member at their current value
+from that point on (not their original first submission). `direction_method` is
+create-only by design — flipping it would re-rank every stored row at once.
 
 ## SDK mapping
 

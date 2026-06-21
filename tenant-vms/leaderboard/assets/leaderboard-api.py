@@ -493,21 +493,42 @@ class Handler(BaseHTTPRequestHandler):
             self._json(201, out)
 
     def h_admin_update_board(self, conn, match, qs):
-        # Toggle a board between cors-default (server-to-server) and cors-public
-        # (browser-submittable) without losing its scores.
+        # Partial update of board config without losing scores. Both fields only
+        # govern FUTURE submits — existing rows are never rewritten, so switching
+        # either is safe. (direction_method is create-only by design: flipping it
+        # would re-rank every stored row at once.)
         body = self._read_json()
         if body is None:
             return
-        if "allow_public_submit" not in body:
-            return self._err(400, "allow_public_submit (bool) required")
-        allow = 1 if body.get("allow_public_submit") else 0
+        sets = []
+        params = []
+        if "allow_public_submit" in body:
+            sets.append("allow_public_submit = ?")
+            params.append(1 if body.get("allow_public_submit") else 0)
+        if "write_policy" in body:
+            policy = str(body.get("write_policy", "")).strip().lower()
+            if policy not in VALID_WRITE_POLICIES:
+                return self._err(400, "write_policy must be one of: " + ", ".join(VALID_WRITE_POLICIES))
+            sets.append("write_policy = ?")
+            params.append(policy)
+        if not sets:
+            return self._err(400, "provide allow_public_submit and/or write_policy")
+        params.append(match.group("key"))
+        # Column names are fixed literals; only values are parameterized.
         cur = conn.execute(
-            "UPDATE boards SET allow_public_submit = ? WHERE board_key = ?",
-            (allow, match.group("key")),
+            "UPDATE boards SET " + ", ".join(sets) + " WHERE board_key = ?", params
         )
         if cur.rowcount == 0:
             return self._err(404, "board not found")
-        self._json(200, {"key": match.group("key"), "allow_public_submit": bool(allow)})
+        row = conn.execute(
+            "SELECT write_policy, allow_public_submit FROM boards WHERE board_key = ?",
+            (match.group("key"),),
+        ).fetchone()
+        self._json(200, {
+            "key": match.group("key"),
+            "write_policy": row["write_policy"],
+            "allow_public_submit": bool(row["allow_public_submit"]),
+        })
 
     def h_admin_delete_board(self, conn, match, qs):
         cur = conn.execute("DELETE FROM boards WHERE board_key = ?", (match.group("key"),))
@@ -1055,7 +1076,6 @@ CONSOLE_HTML = """<!doctype html>
       var info = el('div', {});
       info.appendChild(el('span', { text: b.name || '(unnamed)' }));
       info.appendChild(el('span', { class: 'badge', text: b.direction_method }));
-      info.appendChild(el('span', { class: 'badge', text: ({ keep_best: 'keep best', overwrite: 'overwrite', first: 'first only' })[b.write_policy] || b.write_policy }));
       info.appendChild(el('span', { class: 'badge', text: b.allow_public_submit ? 'public submit' : 'server-only' }));
       info.appendChild(el('div', { class: 'muted', text: 'key: ' + b.key }));
       row.appendChild(info);
@@ -1065,6 +1085,12 @@ CONSOLE_HTML = """<!doctype html>
       rb.appendChild(el('button', { class: 'secondary', text: 'Copy key', onclick: function (e) { copy(b.key, e.target); } }));
       rb.appendChild(el('button', { class: 'secondary', text: b.allow_public_submit ? 'Make server-only' : 'Make public',
         onclick: function () { toggleBoard(b.key, !b.allow_public_submit); } }));
+      var pol = el('select', { onchange: function (e) { setBoardPolicy(b.key, e.target.value); } });
+      ['keep_best', 'overwrite', 'first'].forEach(function (v) {
+        pol.appendChild(el('option', { value: v, text: ({ keep_best: 'keep best', overwrite: 'overwrite', first: 'first only' })[v] }));
+      });
+      pol.value = b.write_policy;
+      rb.appendChild(pol);
       rb.appendChild(el('button', { class: 'danger', text: 'Delete', onclick: function () { delBoard(b.key); } }));
       row.appendChild(rb);
       var card = el('div', { class: 'card' });
@@ -1080,6 +1106,9 @@ CONSOLE_HTML = """<!doctype html>
   function toggleBoard(key, makePublic) {
     if (makePublic && !confirm('Make this board browser-submittable? Anyone with a submit key can post from any web page. Use a submit-only key.')) return;
     api('PATCH', '/admin/boards/' + encodeURIComponent(key), { allow_public_submit: makePublic }).then(loadAll);
+  }
+  function setBoardPolicy(key, policy) {
+    api('PATCH', '/admin/boards/' + encodeURIComponent(key), { write_policy: policy }).then(loadAll);
   }
 
   function toggleEntries(key, box) {
