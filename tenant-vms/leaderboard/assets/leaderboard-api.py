@@ -258,6 +258,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        # Public reads are a credential-less read capability (the board key), so
+        # any origin may read them — a game's browser client displays rankings
+        # cross-origin. NEVER set on writes/admin/key responses: a browser that
+        # could submit would have to carry the access-key secret, which leaks it.
+        if getattr(self, "_cors_read", False):
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -534,6 +540,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        self._cors_read = False
         for route in Handler.ROUTES:
             m, rx, name, auth = route[0], route[1], route[2], route[3]
             scope = route[4] if len(route) > 4 else None
@@ -564,6 +571,8 @@ class Handler(BaseHTTPRequestHandler):
                         if scope and scope not in ak["scopes"].split():
                             return self._err(403, "insufficient scope")
                         return getattr(self, name)(conn, match, qs, ak)
+                    # public route; only the read endpoints opt into cross-origin
+                    self._cors_read = (scope == "cors")
                     return getattr(self, name)(conn, match, qs)
             except Exception:  # noqa: BLE001 — never leak internals to the client
                 return self._err(500, "internal error")
@@ -749,7 +758,7 @@ def _qint(qs, key, default):
 
 # Route table — compiled once. {param} segments become named groups.
 Handler.ROUTES = [
-    ("GET", re.compile(r"^/health$"), "h_health", "public"),
+    ("GET", re.compile(r"^/health$"), "h_health", "public", "cors"),
     # Admin console (HTML) + session lifecycle
     ("GET", re.compile(r"^/$"), "h_console", "public"),
     ("POST", re.compile(r"^/admin/login$"), "h_login", "public"),
@@ -773,9 +782,9 @@ Handler.ROUTES = [
     ("DELETE", re.compile(r"^/leaderboards/(?P<key>[^/]+)/members/(?P<member_id>[^/]+)$"),
      "h_delete_member", "key", "member:delete"),
     # Public reads (board key is the read capability)
-    ("GET", re.compile(r"^/leaderboards/(?P<key>[^/]+)/list$"), "h_list", "public"),
+    ("GET", re.compile(r"^/leaderboards/(?P<key>[^/]+)/list$"), "h_list", "public", "cors"),
     ("GET", re.compile(r"^/leaderboards/(?P<key>[^/]+)/member/(?P<member_id>[^/]+)$"),
-     "h_member", "public"),
+     "h_member", "public", "cors"),
 ]
 
 
