@@ -86,7 +86,7 @@ write_files:
         # 1) create a board (returns its board key)
         curl -s https://__DECLOUD_DOMAIN__/admin/boards \
           -H "x-admin-token: __ADMIN_PASSWORD__" \
-          -d '{"name":"Daily","direction_method":"descending"}'
+          -d '{"name":"Daily","direction_method":"descending","write_policy":"first"}'
         # 2) create an app (label only, no secret)
         curl -s https://__DECLOUD_DOMAIN__/admin/apps \
           -H "x-admin-token: __ADMIN_PASSWORD__" -d '{"label":"my-game"}'

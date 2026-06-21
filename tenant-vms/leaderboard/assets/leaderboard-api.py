@@ -61,6 +61,12 @@ LOGIN_DELAY_S = 0.4                      # per-failure delay (throttle + timing 
 VALID_KEY_SCOPES = ("submit", "member:delete")
 DEFAULT_KEY_SCOPES = ("submit",)
 
+# What happens when a member that already has a row submits again:
+#   keep_best  - update only if the new score beats the old (per direction_method)
+#   overwrite  - the latest submission always replaces
+#   first      - lock to the first submission; later submits are ignored
+VALID_WRITE_POLICIES = ("keep_best", "overwrite", "first")
+
 PORT = int(os.environ.get("PORT", "8080"))
 DB_PATH = os.environ.get("DB_PATH", "/var/lib/leaderboard/leaderboard.db")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
@@ -99,7 +105,8 @@ def init_db():
               board_key                 TEXT PRIMARY KEY,
               name                      TEXT NOT NULL DEFAULT '',
               direction_method          TEXT NOT NULL DEFAULT 'descending',
-              overwrite_score_on_submit INTEGER NOT NULL DEFAULT 0,
+              write_policy              TEXT NOT NULL DEFAULT 'keep_best',
+              allow_public_submit       INTEGER NOT NULL DEFAULT 0,
               created_at                INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS scores (
@@ -146,6 +153,26 @@ def _migrate(conn):
         conn.execute("ALTER TABLE boards DROP COLUMN app_id")
     if "secret_hash" in cols("apps"):
         conn.execute("ALTER TABLE apps DROP COLUMN secret_hash")
+    # v2 → v3: per-board browser-submit policy. Default 0 = cors-default
+    # (server-to-server only); the operator opts a board into cors-public.
+    if "allow_public_submit" not in cols("boards"):
+        conn.execute(
+            "ALTER TABLE boards ADD COLUMN allow_public_submit INTEGER NOT NULL DEFAULT 0"
+        )
+    # v3 → v4: collapse the overwrite_score_on_submit boolean into a 3-valued
+    # write_policy. Backfill overwrite=1 → 'overwrite', else the default
+    # 'keep_best', then drop the legacy column.
+    if "write_policy" not in cols("boards"):
+        conn.execute(
+            "ALTER TABLE boards ADD COLUMN write_policy TEXT NOT NULL DEFAULT 'keep_best'"
+        )
+        if "overwrite_score_on_submit" in cols("boards"):
+            conn.execute(
+                "UPDATE boards SET write_policy = 'overwrite'"
+                " WHERE overwrite_score_on_submit = 1"
+            )
+    if "overwrite_score_on_submit" in cols("boards"):
+        conn.execute("ALTER TABLE boards DROP COLUMN overwrite_score_on_submit")
 
 
 # ── Small helpers ─────────────────────────────────────────────────────────
@@ -318,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
     # — board lookup + the multi-tenant isolation invariant —
     def _lookup_board(self, conn, key):
         return conn.execute(
-            "SELECT board_key, name, direction_method, overwrite_score_on_submit"
+            "SELECT board_key, name, direction_method, write_policy"
             " FROM boards WHERE board_key = ?",
             (key,),
         ).fetchone()
@@ -428,28 +455,35 @@ class Handler(BaseHTTPRequestHandler):
         if direction not in ("ascending", "descending"):
             self._err(400, "direction_method must be 'ascending' or 'descending'")
             return None
-        overwrite = 1 if body.get("overwrite_score_on_submit") else 0
+        policy = str(body.get("write_policy", "") or "keep_best").strip().lower()
+        if policy not in VALID_WRITE_POLICIES:
+            self._err(400, "write_policy must be one of: " + ", ".join(VALID_WRITE_POLICIES))
+            return None
+        allow_public = 1 if body.get("allow_public_submit") else 0
         key = "lb_" + new_token(12)
         conn.execute(
             "INSERT INTO boards(board_key, name, direction_method,"
-            " overwrite_score_on_submit, created_at) VALUES(?,?,?,?,?)",
-            (key, name, direction, overwrite, now_ms()),
+            " write_policy, allow_public_submit, created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (key, name, direction, policy, allow_public, now_ms()),
         )
         return {
             "key": key, "name": name, "direction_method": direction,
-            "overwrite_score_on_submit": bool(overwrite),
+            "write_policy": policy,
+            "allow_public_submit": bool(allow_public),
         }
 
     # ── Admin board management (operator owns every app on the VM) ─────
     def h_admin_list_boards(self, conn, match, qs):
         rows = conn.execute(
-            "SELECT board_key, name, direction_method, overwrite_score_on_submit, created_at"
-            " FROM boards ORDER BY created_at"
+            "SELECT board_key, name, direction_method, write_policy,"
+            " allow_public_submit, created_at FROM boards ORDER BY created_at"
         ).fetchall()
         self._json(200, {"boards": [{
             "key": r["board_key"], "name": r["name"],
             "direction_method": r["direction_method"],
-            "overwrite_score_on_submit": bool(r["overwrite_score_on_submit"]),
+            "write_policy": r["write_policy"],
+            "allow_public_submit": bool(r["allow_public_submit"]),
             "created_at": r["created_at"],
         } for r in rows]})
 
@@ -457,6 +491,23 @@ class Handler(BaseHTTPRequestHandler):
         out = self._create_board(conn)
         if out is not None:
             self._json(201, out)
+
+    def h_admin_update_board(self, conn, match, qs):
+        # Toggle a board between cors-default (server-to-server) and cors-public
+        # (browser-submittable) without losing its scores.
+        body = self._read_json()
+        if body is None:
+            return
+        if "allow_public_submit" not in body:
+            return self._err(400, "allow_public_submit (bool) required")
+        allow = 1 if body.get("allow_public_submit") else 0
+        cur = conn.execute(
+            "UPDATE boards SET allow_public_submit = ? WHERE board_key = ?",
+            (allow, match.group("key")),
+        )
+        if cur.rowcount == 0:
+            return self._err(404, "board not found")
+        self._json(200, {"key": match.group("key"), "allow_public_submit": bool(allow)})
 
     def h_admin_delete_board(self, conn, match, qs):
         cur = conn.execute("DELETE FROM boards WHERE board_key = ?", (match.group("key"),))
@@ -472,6 +523,33 @@ class Handler(BaseHTTPRequestHandler):
         if cur.rowcount == 0:
             return self._err(404, "member not found")
         self._json(204, {})
+
+    def h_admin_set_member(self, conn, match, qs):
+        # Operator override: set a member's score/metadata exactly, creating the
+        # row if absent. Unlike submit, this bypasses keep-best — a correction
+        # sets the value the operator typed, regardless of direction/overwrite.
+        key = match.group("key")
+        b = self._lookup_board(conn, key)
+        if b is None:
+            return self._err(404, "board not found")
+        member_id = match.group("member_id")
+        if len(member_id) > MAX_MEMBER_ID_LEN:
+            return self._err(400, "member_id too long")
+        body = self._read_json()
+        if body is None:
+            return
+        if not isinstance(body.get("score"), int) or isinstance(body.get("score"), bool):
+            return self._err(400, "score must be an integer")
+        metadata = str(body.get("metadata", ""))
+        if len(metadata.encode("utf-8")) > MAX_METADATA_BYTES:
+            return self._err(400, "metadata too long")
+        conn.execute(
+            "INSERT INTO scores(board_key, member_id, score, metadata, updated_at)"
+            " VALUES(?,?,?,?,?) ON CONFLICT(board_key, member_id) DO UPDATE SET"
+            " score=excluded.score, metadata=excluded.metadata, updated_at=excluded.updated_at",
+            (key, member_id, body["score"], metadata, now_ms()),
+        )
+        self._json(200, member_entry(conn, key, b["direction_method"], member_id) or {})
 
     # ── Admin: access keys (per-(app,board) credential + grant) ───────
     def h_admin_issue_key(self, conn, match, qs):
@@ -559,11 +637,17 @@ class Handler(BaseHTTPRequestHandler):
                         via_header = self._admin_via_header()
                         if not (via_cookie or via_header):
                             return self._err(401, "admin authentication required")
-                        if method in ("POST", "DELETE") and via_cookie and not via_header:
+                        if method in ("POST", "DELETE", "PATCH", "PUT") and via_cookie and not via_header:
                             if not self._csrf_ok():
                                 return self._err(403, "cross-origin request rejected")
                         return getattr(self, name)(conn, match, qs)
                     if auth == "key":
+                        if "cors_board" in route[4:]:
+                            row = conn.execute(
+                                "SELECT allow_public_submit FROM boards"
+                                " WHERE board_key = ?", (match.group("key"),),
+                            ).fetchone()
+                            self._cors = bool(row and row["allow_public_submit"])
                         ak = self._resolve_key(conn)
                         if ak is None:
                             return self._err(401, "invalid access key")
@@ -588,16 +672,36 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._dispatch("DELETE")
 
+    def do_PATCH(self):
+        self._dispatch("PATCH")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
+
     def do_OPTIONS(self):
         # CORS preflight, answered only for routes marked "cors" (the public
         # reads and POST /submit). Any other path falls through to 404 so the
         # browser blocks the write. No auth and no DB — a preflight carries none.
         self._cors = False
         path = urlparse(self.path).path
-        methods = sorted({r[0] for r in Handler.ROUTES
-                          if "cors" in r[4:] and r[1].match(path)})
+        methods = set()
+        for route in Handler.ROUTES:
+            mt = route[1].match(path)
+            if not mt:
+                continue
+            if "cors" in route[4:]:
+                methods.add(route[0])
+            elif "cors_board" in route[4:]:
+                with connect() as conn:
+                    row = conn.execute(
+                        "SELECT allow_public_submit FROM boards"
+                        " WHERE board_key = ?", (mt.group("key"),),
+                    ).fetchone()
+                if row and row["allow_public_submit"]:
+                    methods.add(route[0])
         if not methods:
             return self._err(404, "not found")
+        methods = sorted(methods)
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", ", ".join(methods + ["OPTIONS"]))
@@ -672,21 +776,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "metadata too long")
 
         key = b["board_key"]
-        # Upsert-on-improve unless the board overwrites unconditionally. The WHERE
-        # on the conflict path leaves the existing row untouched when the new score
-        # does not beat it — just the comparison the board declares, no extra gate.
-        base = (
+        # The board's write_policy decides what a repeat submission does. The
+        # conflict clause encodes it: DO NOTHING locks to the first row; an
+        # unconditional DO UPDATE overwrites; a WHERE on the update keeps the best.
+        insert = (
             "INSERT INTO scores(board_key, member_id, score, metadata, updated_at)"
             " VALUES(?,?,?,?,?)"
+        )
+        update = (
             " ON CONFLICT(board_key, member_id) DO UPDATE SET"
             " score=excluded.score, metadata=excluded.metadata, updated_at=excluded.updated_at"
         )
-        if b["overwrite_score_on_submit"]:
-            sql = base
+        policy = b["write_policy"]
+        if policy == "first":
+            sql = insert + " ON CONFLICT(board_key, member_id) DO NOTHING"
+        elif policy == "overwrite":
+            sql = insert + update
         elif b["direction_method"] == "descending":
-            sql = base + " WHERE excluded.score > scores.score"
-        else:  # ascending: lower is better
-            sql = base + " WHERE excluded.score < scores.score"
+            sql = insert + update + " WHERE excluded.score > scores.score"
+        else:  # keep_best, ascending: lower is better
+            sql = insert + update + " WHERE excluded.score < scores.score"
         conn.execute(sql, (key, member_id, score, metadata, now_ms()))
 
         # Return the member's authoritative current standing (not the value just
@@ -789,15 +898,18 @@ Handler.ROUTES = [
     # Operator: project-wide boards (lifecycle is operator-only)
     ("GET", re.compile(r"^/admin/boards$"), "h_admin_list_boards", "admin"),
     ("POST", re.compile(r"^/admin/boards$"), "h_admin_create_board", "admin"),
+    ("PATCH", re.compile(r"^/admin/boards/(?P<key>[^/]+)$"), "h_admin_update_board", "admin"),
     ("DELETE", re.compile(r"^/admin/boards/(?P<key>[^/]+)$"), "h_admin_delete_board", "admin"),
     ("DELETE", re.compile(r"^/admin/boards/(?P<key>[^/]+)/members/(?P<member_id>[^/]+)$"),
      "h_admin_delete_member", "admin"),
+    ("PUT", re.compile(r"^/admin/boards/(?P<key>[^/]+)/members/(?P<member_id>[^/]+)$"),
+     "h_admin_set_member", "admin"),
     # Operator: access keys issued under an app, each bound to one board
     ("GET", re.compile(r"^/admin/apps/(?P<app_id>[^/]+)/keys$"), "h_admin_list_keys", "admin"),
     ("POST", re.compile(r"^/admin/apps/(?P<app_id>[^/]+)/keys$"), "h_admin_issue_key", "admin"),
     ("DELETE", re.compile(r"^/admin/keys/(?P<key_id>[^/]+)$"), "h_admin_revoke_key", "admin"),
     # Key-authenticated writes (secret bound to one board; scope-gated)
-    ("POST", re.compile(r"^/leaderboards/(?P<key>[^/]+)/submit$"), "h_submit", "key", "submit", "cors"),
+    ("POST", re.compile(r"^/leaderboards/(?P<key>[^/]+)/submit$"), "h_submit", "key", "submit", "cors_board"),
     ("DELETE", re.compile(r"^/leaderboards/(?P<key>[^/]+)/members/(?P<member_id>[^/]+)$"),
      "h_delete_member", "key", "member:delete"),
     # Public reads (board key is the read capability)
@@ -861,9 +973,10 @@ CONSOLE_HTML = """<!doctype html>
         <li><strong>Create a board</strong> below. Boards are project-wide and shared; the board key is the public read capability.</li>
         <li><strong>Create an app</strong> &mdash; just a label (a game or partner). Apps hold no secret.</li>
         <li><strong>Issue an access key</strong> under the app, bound to that board, with the rights you grant: <code>submit</code> (default) and optionally <code>member:delete</code>. The secret is shown once &mdash; store it then.</li>
-        <li>Your <strong>server</strong> submits scores with the key secret in the <code>x-session-token</code> header. Submit from your server, not the game client.</li>
+        <li>Your <strong>server</strong> submits scores with the key secret in the <code>x-session-token</code> header. By default a board is <strong>server-only</strong> &mdash; browsers can't submit.</li>
       </ol>
       <p class="muted">Reads are public &mdash; anyone with a board key can read rankings, no auth. A key works only on its one board and only for the rights you granted. Revoke a key, or revoke its app to disable every key under it at once.</p>
+      <p class="muted">A board can be made <strong>public submit</strong> (toggle below) so a browser game with no backend can post directly. The key then lives in the client, so use a submit-only key &mdash; anyone can post scores to that board. Leave boards server-only when score integrity matters.</p>
     </details>
 
     <h2>Boards</h2>
@@ -873,7 +986,12 @@ CONSOLE_HTML = """<!doctype html>
         <option value="descending">descending (higher wins)</option>
         <option value="ascending">ascending (lower wins)</option>
       </select>
-      <label class="muted"><input id="bOver" type="checkbox"> overwrite</label>
+      <select id="bPolicy">
+        <option value="keep_best">keep best</option>
+        <option value="overwrite">overwrite (latest)</option>
+        <option value="first">first only (lock)</option>
+      </select>
+      <label class="muted"><input id="bPublic" type="checkbox"> public (browser) submit</label>
       <button id="createBoardBtn">Add board</button>
     </div>
     <div id="boards"></div>
@@ -937,19 +1055,101 @@ CONSOLE_HTML = """<!doctype html>
       var info = el('div', {});
       info.appendChild(el('span', { text: b.name || '(unnamed)' }));
       info.appendChild(el('span', { class: 'badge', text: b.direction_method }));
-      if (b.overwrite_score_on_submit) info.appendChild(el('span', { class: 'badge', text: 'overwrite' }));
+      info.appendChild(el('span', { class: 'badge', text: ({ keep_best: 'keep best', overwrite: 'overwrite', first: 'first only' })[b.write_policy] || b.write_policy }));
+      info.appendChild(el('span', { class: 'badge', text: b.allow_public_submit ? 'public submit' : 'server-only' }));
       info.appendChild(el('div', { class: 'muted', text: 'key: ' + b.key }));
       row.appendChild(info);
+      var entriesBox = el('div', { class: 'keys hidden' });
       var rb = el('div', { class: 'row' });
+      rb.appendChild(el('button', { class: 'secondary', text: 'Entries', onclick: function () { toggleEntries(b.key, entriesBox); } }));
       rb.appendChild(el('button', { class: 'secondary', text: 'Copy key', onclick: function (e) { copy(b.key, e.target); } }));
+      rb.appendChild(el('button', { class: 'secondary', text: b.allow_public_submit ? 'Make server-only' : 'Make public',
+        onclick: function () { toggleBoard(b.key, !b.allow_public_submit); } }));
       rb.appendChild(el('button', { class: 'danger', text: 'Delete', onclick: function () { delBoard(b.key); } }));
-      row.appendChild(rb); wrap.appendChild(row);
+      row.appendChild(rb);
+      var card = el('div', { class: 'card' });
+      card.appendChild(row); card.appendChild(entriesBox);
+      wrap.appendChild(card);
     });
   }
   function createBoard() {
-    api('POST', '/admin/boards', { name: $('bName').value, direction_method: $('bDir').value, overwrite_score_on_submit: $('bOver').checked }).then(function (r) {
-      if (r.status === 201) { $('bName').value = ''; $('bOver').checked = false; loadAll(); }
+    api('POST', '/admin/boards', { name: $('bName').value, direction_method: $('bDir').value, write_policy: $('bPolicy').value, allow_public_submit: $('bPublic').checked }).then(function (r) {
+      if (r.status === 201) { $('bName').value = ''; $('bPolicy').value = 'keep_best'; $('bPublic').checked = false; loadAll(); }
     });
+  }
+  function toggleBoard(key, makePublic) {
+    if (makePublic && !confirm('Make this board browser-submittable? Anyone with a submit key can post from any web page. Use a submit-only key.')) return;
+    api('PATCH', '/admin/boards/' + encodeURIComponent(key), { allow_public_submit: makePublic }).then(loadAll);
+  }
+
+  function toggleEntries(key, box) {
+    if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden'); renderEntries(key, box);
+  }
+  function renderEntries(key, box, after) {
+    if (!after) box.textContent = '';
+    api('GET', '/leaderboards/' + encodeURIComponent(key) + '/list?count=100' + (after ? '&after=' + encodeURIComponent(after) : '')).then(function (r) {
+      var data = r.json || {}; var items = data.items || [];
+      if (!after) box.appendChild(entryAddForm(key, box));
+      items.forEach(function (it) { box.appendChild(entryRow(key, box, it)); });
+      if (!items.length && !after) box.appendChild(el('p', { class: 'muted', text: 'No entries yet.' }));
+      var pg = data.pagination || {};
+      if (pg.next_cursor) {
+        var more = el('button', { class: 'secondary', text: 'Load more', onclick: function () { more.remove(); renderEntries(key, box, pg.next_cursor); } });
+        box.appendChild(more);
+      }
+    });
+  }
+  function entryRow(key, box, it) {
+    var row = el('div', { class: 'row between brow' });
+    var info = el('div', {});
+    info.appendChild(el('span', { class: 'badge', text: '#' + it.rank }));
+    info.appendChild(el('span', { text: ' ' + it.member_id }));
+    info.appendChild(el('span', { class: 'badge', text: 'score ' + it.score }));
+    if (it.metadata) info.appendChild(el('div', { class: 'muted', text: it.metadata }));
+    row.appendChild(info);
+    var rb = el('div', { class: 'row' });
+    rb.appendChild(el('button', { class: 'secondary', text: 'Edit', onclick: function () { editEntry(key, box, it, row); } }));
+    rb.appendChild(el('button', { class: 'danger', text: 'Delete', onclick: function () { delEntry(key, box, it.member_id); } }));
+    row.appendChild(rb);
+    return row;
+  }
+  function editEntry(key, box, it, row) {
+    row.textContent = '';
+    var sc = el('input', { type: 'number', value: String(it.score), style: 'width:7rem' });
+    var md = el('input', { type: 'text', value: it.metadata || '', placeholder: 'metadata', style: 'min-width:10rem' });
+    var left = el('div', { class: 'row' });
+    left.appendChild(el('span', { text: it.member_id })); left.appendChild(sc); left.appendChild(md);
+    var right = el('div', { class: 'row' });
+    right.appendChild(el('button', { text: 'Save', onclick: function () {
+      var v = parseInt(sc.value, 10); if (isNaN(v)) return;
+      api('PUT', '/admin/boards/' + encodeURIComponent(key) + '/members/' + encodeURIComponent(it.member_id), { score: v, metadata: md.value }).then(function () { renderEntries(key, box); });
+    } }));
+    right.appendChild(el('button', { class: 'secondary', text: 'Cancel', onclick: function () { renderEntries(key, box); } }));
+    row.appendChild(left); row.appendChild(right);
+  }
+  function delEntry(key, box, member_id) {
+    if (!confirm('Delete ' + member_id + ' from this board?')) return;
+    api('DELETE', '/admin/boards/' + encodeURIComponent(key) + '/members/' + encodeURIComponent(member_id)).then(function () { renderEntries(key, box); });
+  }
+  function entryAddForm(key, box) {
+    var f = el('div', { class: 'card' });
+    f.appendChild(el('strong', { text: 'Add / set entry' }));
+    var mid = el('input', { type: 'text', placeholder: 'member_id', style: 'min-width:10rem' });
+    var sc = el('input', { type: 'number', placeholder: 'score', style: 'width:7rem' });
+    var md = el('input', { type: 'text', placeholder: 'metadata (optional)', style: 'min-width:10rem' });
+    var out = el('div', {});
+    var add = el('button', { text: 'Save entry', onclick: function () {
+      var v = parseInt(sc.value, 10); out.textContent = '';
+      if (!mid.value || isNaN(v)) { out.appendChild(el('p', { class: 'err', text: 'member_id and integer score required.' })); return; }
+      api('PUT', '/admin/boards/' + encodeURIComponent(key) + '/members/' + encodeURIComponent(mid.value), { score: v, metadata: md.value }).then(function (r) {
+        if (r.status === 200) { renderEntries(key, box); } else { out.appendChild(el('p', { class: 'err', text: 'Save failed.' })); }
+      });
+    } });
+    var rowf = el('div', { class: 'row', style: 'margin-top:.4rem' });
+    rowf.appendChild(mid); rowf.appendChild(sc); rowf.appendChild(md); rowf.appendChild(add);
+    f.appendChild(rowf); f.appendChild(out);
+    return f;
   }
   function delBoard(key) {
     if (!confirm('Delete this board and all its scores? Access keys bound to it are removed too.')) return;

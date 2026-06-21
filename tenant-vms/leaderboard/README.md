@@ -6,6 +6,10 @@ label-only **apps**, and per-board **access keys**. The HTTP API mirrors
 LootLocker's server leaderboard API, so a game using LootLocker or a portal SDK
 (Playgama, CrazyGames, Poki) integrates with a thin adapter.
 
+Each board's `write_policy` decides what a repeat submission does: `keep_best`
+(default), `overwrite` (latest wins), or `first` (lock to the first submission and
+ignore later ones — useful for daily challenges).
+
 ## Architecture
 
 The service ships as a real **DeCloud artifact** (`leaderboard`), not embedded
@@ -47,7 +51,8 @@ role-wins).
 (deploy) password, which is exchanged once at `POST /admin/login` for a
 short-lived `HttpOnly; Secure; SameSite=Strict` session cookie — the password is
 never resent and the cookie is unreadable to JS. The console manages boards,
-apps, and access keys, and includes a "How to use" panel. Admin endpoints accept
+apps, and access keys; lets the operator browse, edit, add, and delete board
+entries (the edit bypasses keep-best); and includes a "How to use" panel. Admin endpoints accept
 either the session cookie or the `x-admin-token` header (for curl /
 server-to-server). Cookie-authenticated mutations require a same-origin
 Origin/Referer (CSRF defense); header-authenticated calls skip that check.
@@ -57,8 +62,10 @@ Origin/Referer (CSRF defense); header-authenticated calls skip that check.
 Authenticates the **deployer's server**, not end users. `member_id`/name are
 whatever the caller passes; verifying a portal player token (CrazyGames / Poki /
 Yandex) is your backend's job. Guarantees **authenticated, persisted, ranked** —
-never that a score is legitimate. **Submit from your server, not a game client**
-(a client that embeds an access-key secret leaks it).
+never that a score is legitimate. By default **submit from your server, not a game
+client** (a client that embeds an access-key secret leaks it). A board can opt
+into public browser submit — see "Submit policy" below — which trades that
+integrity for convenience on casual boards.
 
 ## Auth model
 
@@ -93,9 +100,11 @@ POST   /admin/apps                         {"label":"my-game"}  -> {app_id, labe
 GET    /admin/apps
 DELETE /admin/apps/{app_id}
 GET    /admin/boards
-POST   /admin/boards                       {"name","direction_method","overwrite_score_on_submit"}
+POST   /admin/boards                       {"name","direction_method","write_policy","allow_public_submit"}
+PATCH  /admin/boards/{key}                  {"allow_public_submit": true|false}   (toggle CORS mode)
 DELETE /admin/boards/{key}
 DELETE /admin/boards/{key}/members/{member_id}
+PUT    /admin/boards/{key}/members/{member_id}   {"score","metadata"}   (operator set/correct; bypasses keep-best)
 GET    /admin/apps/{app_id}/keys
 POST   /admin/apps/{app_id}/keys           {"board_key","scopes":["submit"]}  -> {key_id, secret}
 DELETE /admin/keys/{key_id}
@@ -108,6 +117,24 @@ GET    /leaderboards/{key}/member/{member_id}?around=3
 GET    /health
 ```
 
+## Submit policy (CORS)
+
+Each board declares whether browsers may submit, via `allow_public_submit`
+(default `false`):
+
+- **cors-default** (`false`): `POST /submit` is server-to-server only. The CORS
+  preflight (`OPTIONS`) is refused and responses carry no
+  `Access-Control-Allow-Origin`, so browser writes are blocked. This is the
+  secure default; keep it when score integrity matters.
+- **cors-public** (`true`): the preflight succeeds and submit responses carry
+  `Access-Control-Allow-Origin: *`, so a browser game with no backend can post
+  directly. The submit key then lives in the client — use a **submit-only** key,
+  and accept that anyone can post scores to that board.
+
+Toggle a board between modes without losing scores via
+`PATCH /admin/boards/{key}`. Public reads are always cross-origin; `member:delete`,
+admin, and key endpoints are never browser-accessible on either mode.
+
 ## SDK mapping
 
 | Concept | This service | LootLocker | Playgama Bridge |
@@ -117,7 +144,7 @@ GET    /health
 | Member rank | `GET .../member/{member_id}` | Get Member Rank | — |
 | Around me (±N) | `GET .../member/{member_id}?around=3` | (compose list + member) | — |
 | Remove a member | `DELETE /leaderboards/{key}/members/{member_id}` | Delete Score | — |
-| Keep best / overwrite | `overwrite_score_on_submit` | `overwrite_score_on_submit` | platform default |
+| Update policy | `write_policy` (keep_best/overwrite/first) | `overwrite_score_on_submit` | platform default |
 
 ## Notes
 
