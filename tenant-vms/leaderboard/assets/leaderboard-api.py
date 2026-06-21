@@ -258,11 +258,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        # Public reads are a credential-less read capability (the board key), so
-        # any origin may read them — a game's browser client displays rankings
-        # cross-origin. NEVER set on writes/admin/key responses: a browser that
-        # could submit would have to carry the access-key secret, which leaks it.
-        if getattr(self, "_cors_read", False):
+        # Cross-origin is allowed only on routes the route table marks "cors":
+        # the public reads, and POST /submit (a board the operator opted into
+        # browser writes with a submit-only key). Admin, key-management, and
+        # member:delete responses never carry this header.
+        if getattr(self, "_cors", False):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command != "HEAD":
@@ -540,7 +540,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        self._cors_read = False
+        self._cors = False
         for route in Handler.ROUTES:
             m, rx, name, auth = route[0], route[1], route[2], route[3]
             scope = route[4] if len(route) > 4 else None
@@ -549,6 +549,9 @@ class Handler(BaseHTTPRequestHandler):
             match = rx.match(path)
             if not match:
                 continue
+            # Cross-origin allowed only on routes explicitly marked "cors"
+            # (the public reads and POST /submit); _json emits ACAO when set.
+            self._cors = "cors" in route[4:]
             try:
                 with connect() as conn:
                     if auth == "admin":
@@ -571,8 +574,6 @@ class Handler(BaseHTTPRequestHandler):
                         if scope and scope not in ak["scopes"].split():
                             return self._err(403, "insufficient scope")
                         return getattr(self, name)(conn, match, qs, ak)
-                    # public route; only the read endpoints opt into cross-origin
-                    self._cors_read = (scope == "cors")
                     return getattr(self, name)(conn, match, qs)
             except Exception:  # noqa: BLE001 — never leak internals to the client
                 return self._err(500, "internal error")
@@ -586,6 +587,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._dispatch("DELETE")
+
+    def do_OPTIONS(self):
+        # CORS preflight, answered only for routes marked "cors" (the public
+        # reads and POST /submit). Any other path falls through to 404 so the
+        # browser blocks the write. No auth and no DB — a preflight carries none.
+        self._cors = False
+        path = urlparse(self.path).path
+        methods = sorted({r[0] for r in Handler.ROUTES
+                          if "cors" in r[4:] and r[1].match(path)})
+        if not methods:
+            return self._err(404, "not found")
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", ", ".join(methods + ["OPTIONS"]))
+        self.send_header("Access-Control-Allow-Headers", "content-type, x-session-token")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, fmt, *args):
         # Journald captures stderr; keep a terse access line, no bodies/secrets.
@@ -778,7 +797,7 @@ Handler.ROUTES = [
     ("POST", re.compile(r"^/admin/apps/(?P<app_id>[^/]+)/keys$"), "h_admin_issue_key", "admin"),
     ("DELETE", re.compile(r"^/admin/keys/(?P<key_id>[^/]+)$"), "h_admin_revoke_key", "admin"),
     # Key-authenticated writes (secret bound to one board; scope-gated)
-    ("POST", re.compile(r"^/leaderboards/(?P<key>[^/]+)/submit$"), "h_submit", "key", "submit"),
+    ("POST", re.compile(r"^/leaderboards/(?P<key>[^/]+)/submit$"), "h_submit", "key", "submit", "cors"),
     ("DELETE", re.compile(r"^/leaderboards/(?P<key>[^/]+)/members/(?P<member_id>[^/]+)$"),
      "h_delete_member", "key", "member:delete"),
     # Public reads (board key is the read capability)
