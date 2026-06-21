@@ -817,12 +817,12 @@ class Handler(BaseHTTPRequestHandler):
             sql = insert + update + " WHERE excluded.score > scores.score"
         else:  # keep_best, ascending: lower is better
             sql = insert + update + " WHERE excluded.score < scores.score"
-        conn.execute(sql, (key, member_id, score, metadata, now_ms()))
+        cur = conn.execute(sql, (key, member_id, score, metadata, now_ms()))
 
         # Return the member's authoritative current standing (not the value just
         # submitted, which keep-best may have rejected).
-        entry = member_entry(conn, key, b["direction_method"], member_id)
-        self._json(200, entry or {})
+        entry = member_entry(conn, key, b["direction_method"], member_id) or {}
+        self._json(200, {"accepted": cur.rowcount > 0, **entry})
 
     def h_delete_member(self, conn, match, qs, ak):
         cur = conn.execute(
