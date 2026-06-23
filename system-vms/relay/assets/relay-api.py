@@ -45,6 +45,9 @@ RELAY_CAPACITY = int(_meta.get('max_capacity', 10))
 # host's own system VMs separately from CGNAT-node-owned ones on the dashboard.
 # 'unknown' fallback covers very old metadata files written before this field existed.
 NODE_ID        = _meta.get('node_id', 'unknown')
+# Per-relay control-plane token (RelayObligationState.AuthToken), provisioned
+# via relay-metadata.json. Only the orchestrator holds it. Empty => fail closed.
+RELAY_API_TOKEN = _meta.get('api_token', '')
 WIREGUARD_INTERFACE = "wg-relay-server"
 STATIC_DIR = "/opt/decloud-relay/static"
 LISTEN_PORT = 8080
@@ -752,8 +755,26 @@ class RelayAPIHandler(BaseHTTPRequestHandler):
         else:
             self.send_error_response(404, 'Not Found', f'Path {path} not found')
     
+    def _is_authorized(self):
+        """Constant-time Bearer-token check against the provisioned per-relay
+        token. Fail-closed: if no token was provisioned, reject all mutations.
+        Mirrors the DHT/BlockStore join-token boundary enforced server-side."""
+        import hmac as _hmac
+        if not RELAY_API_TOKEN:
+            logger.error("Relay API token not provisioned; rejecting POST")
+            return False
+        header = self.headers.get('Authorization', '')
+        if not header.startswith('Bearer '):
+            return False
+        presented = header[len('Bearer '):].strip()
+        return _hmac.compare_digest(presented, RELAY_API_TOKEN)
+
     def do_POST(self):
         """Handle POST requests"""
+        if not self._is_authorized():
+            self.send_error_response(401, 'Unauthorized',
+                                     'Valid relay API token required')
+            return
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         

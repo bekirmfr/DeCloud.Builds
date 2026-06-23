@@ -378,8 +378,8 @@ write_files:
           fi
       done
 
-  - path: /etc/decloud/relay-metadata.json
-    permissions: '0644'
+- path: /etc/decloud/relay-metadata.json
+    permissions: '0600'
     content: |
       {
         "node_id": "__NODE_ID__",
@@ -393,6 +393,7 @@ write_files:
         "wireguard_endpoint": "__PUBLIC_IP__:51820",
         "wireguard_public_key": "__WIREGUARD_PUBLIC_KEY__",
         "orchestrator_public_key": "__ORCHESTRATOR_PUBLIC_KEY__",
+        "api_token": "__RELAY_API_TOKEN__",
         "created_at": "__TIMESTAMP__",
         "version": "6.2"
       }
