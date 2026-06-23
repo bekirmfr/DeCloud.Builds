@@ -75,6 +75,22 @@ packages:
   - python3
 
 write_files:
+  # Hardware watchdog integration. The i6300esb device declared in the VM's
+  # domain XML (system VMs only) resets the guest if systemd stops petting
+  # /dev/watchdog. RuntimeWatchdogSec sets the pet interval; if the kernel or
+  # systemd itself wedges — e.g. a virtio-serial/virtio-net stall that takes
+  # out both the guest agent and the network API while the process stays
+  # "alive" — petting stops and the hardware resets the guest in ~30s. This
+  # recovers freezes that in-guest software cannot recover from itself, at the
+  # hypervisor boundary, with no host-side reconciler involvement.
+  # The i6300esb driver ships in the Debian 12 cloud kernel; no package needed.
+  - path: /etc/systemd/system.conf.d/watchdog.conf
+    permissions: '0644'
+    content: |
+      [Manager]
+      RuntimeWatchdogSec=15s
+      RebootWatchdogSec=2min
+
   # WireGuard mesh environment.
   # Consumed by /usr/local/bin/wg-config-fetch.sh (fetched by role layer's
   # artifact pipeline) and by wg-quick@wg-mesh via the override below.
