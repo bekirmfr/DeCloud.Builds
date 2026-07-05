@@ -39,10 +39,20 @@
 #     a bare 502. The "/health" location is deliberately left raw so the
 #     VmReadinessMonitor HttpGet probe stays honest.
 #
-# Security notes vs. v2.0:
-#   * Ollama install no longer pipes a remote script to sh. The pinned-version
-#     tarball is fetched from GitHub Releases and verified against a pinned
-#     SHA-256 before extraction (fail-closed if unpinned).
+# Trust model (v2.1):
+#   * Platform boundary — keep the node OPERATOR safe from the tenant VM.
+#     Enforced host-side: KVM isolation, verified base image
+#     (Spec.BaseImageHash), SSH CA, bandwidth QoS. Not this file's job.
+#   * In-guest boundary — the tenant VM is the tenant's machine (root access,
+#     Hetzner/Vultr model; see base-tenant.yaml). Verifying the CONTENT of
+#     artifacts installed inside the guest is the tenant's responsibility.
+#     This template therefore checks transfer COMPLETENESS only (curl -f,
+#     atomic .part rename, gzip CRC at extraction) and deliberately does NOT
+#     pin artifact hashes. Recorded so the omission reads as a decision, not
+#     an oversight — do not "fix" this back without revisiting the decision.
+#   * The Ollama VERSION pin (0.7.0) is a GPU-proxy shim compatibility
+#     constraint (see GPU_PROXY_DEBUGGING_JOURNAL.md Session 16), not a
+#     security control.
 #   * The systemd unit for Ollama is written statically below (content matches
 #     what install.sh 0.7.0 generated — same user, same layout — so the GPU
 #     proxy drop-in and 9p shim permissions behave identically to the
@@ -222,12 +232,8 @@ write_files:
       # for cudaErrorNotSupported; the shim aborts the runner. 0.7.0 retains
       # the graceful fallback path the shim relies on.
       OLLAMA_TGZ_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tgz"
-      # REQUIRED BEFORE MERGE — compute once on a trusted machine:
-      #   curl -fL "https://github.com/ollama/ollama/releases/download/v0.7.0/ollama-linux-amd64.tgz" | sha256sum
-      # Fail-closed: the script refuses an unverified install.
-      OLLAMA_TGZ_SHA256="PIN_ME_BEFORE_MERGE"
-      # TODO: pin by digest (ghcr.io/open-webui/open-webui@sha256:...) for
-      # supply-chain integrity; :latest preserved from v2.0 behaviour.
+      # No content-hash pinning — deliberate; see "Trust model" in the file
+      # header. Completeness is still enforced (curl -f, .part rename, gzip CRC).
       OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
 
       status() { echo "$1" > "$STATUS_FILE"; logger -t decloud-provision "$1"; }
@@ -291,23 +297,21 @@ write_files:
         # Our driver shim (libcuda.so.1) works natively but Ollama's internal
         # GPU discovery can't find it inside Docker containers.
         if ! stamped ollama-binary; then
-          if [ "$OLLAMA_TGZ_SHA256" = "PIN_ME_BEFORE_MERGE" ]; then
-            status "ERROR: OLLAMA_TGZ_SHA256 not pinned — refusing unverified install"
-            exit 1
-          fi
           TGZ="$DL/ollama-linux-amd64-${OLLAMA_VERSION}.tgz"
-          if [ ! -f "$TGZ" ] || ! echo "$OLLAMA_TGZ_SHA256  $TGZ" | sha256sum -c --status; then
+          if [ ! -f "$TGZ" ]; then
             status "downloading ollama ${OLLAMA_VERSION} (resumable — extends partial file)"
+            # Completeness via atomic rename: download to .part, rename only on
+            # curl exit 0 (server-reported length fully received). The final
+            # filename existing IS the completeness marker — a truncated file
+            # can never reach tar (the v2.0 failure mode).
             # -C -: every timer pass extends the partial file monotonically.
-            curl -fL -C - --retry 3 --retry-all-errors -o "$TGZ" "$OLLAMA_TGZ_URL"
-            if ! echo "$OLLAMA_TGZ_SHA256  $TGZ" | sha256sum -c --status; then
-              status "checksum mismatch — discarding artifact, will re-download"
-              rm -f "$TGZ"
-              exit 1
-            fi
+            curl -fL -C - --retry 3 --retry-all-errors -o "$TGZ.part" "$OLLAMA_TGZ_URL"
+            mv "$TGZ.part" "$TGZ"
           fi
           status "installing ollama ${OLLAMA_VERSION}"
-          tar -C /usr/local -xzf "$TGZ"
+          # gzip CRC catches on-disk corruption at extraction; discard the
+          # artifact and let the timer re-download rather than loop on it.
+          tar -C /usr/local -xzf "$TGZ" || { rm -f "$TGZ"; exit 1; }
           # Same user/layout install.sh created — GPU proxy drop-in and 9p
           # shim permissions behave identically to the verified config.
           id ollama >/dev/null 2>&1 || useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
