@@ -18,7 +18,7 @@
 #   ${VAR}       — bash runtime expansion inside heredocs / shell scripts
 #                  (NOT a render-time substitution).
 #
-# ── Provisioning model (v2.2: base contract v1) ──────────────────────────
+# ── Provisioning model (v2.3: base contract v1 + GPU discovery gate) ─────
 #
 # The reconciler mechanism (helper library, decloud-provision.service/.timer,
 # well-known status files) is inherited from base-tenant.yaml — see
@@ -26,6 +26,8 @@
 #   * /opt/decloud/provision.sh — the workload phases (sources the library)
 #   * nginx front with a live per-component setup page on "/" and a raw
 #     /health passthrough so the VmReadinessMonitor HttpGet probe stays honest
+#   * a GPU-discovery startup gate for ollama.service (ExecStartPre) — see
+#     the /opt/decloud/gpu-proxy-ready.sh header for the race it closes
 #
 # Every large transfer is MONOTONIC: the Ollama tarball resumes via the
 # library's fetch() (curl -C -, atomic .part rename), docker pulls resume
@@ -195,6 +197,86 @@ write_files:
 
       [Install]
       WantedBy=default.target
+
+  # ── GPU proxy startup gate for ollama.service ────────────────────────
+  # Ollama 0.7.0 runs GPU discovery exactly ONCE, at server start. If the
+  # DeCloud proxy transport is unreachable at that instant — first
+  # provision (service started moments after configuration) or reboot
+  # (unit starts ~5s into boot) — discovery records zero GPUs and the
+  # server schedules CPU-only until restarted. Observed signature:
+  # "no compatible GPUs were discovered" at boot+5s, then models load
+  # 100% CPU while CUDA0 compute buffers still appear (the runner's LAZY
+  # shim connection succeeds later; only discovery raced).
+  #
+  # Fix at the systemd boundary, not a sleep: ExecStartPre fails while the
+  # proxy is unreachable and the unit's Restart=always/RestartSec=3 is the
+  # retry loop — level-based, no timing assumptions. Probes the same
+  # transport order as shim/transport.c: env overrides →
+  # /etc/decloud/gpu-proxy.env → defaults (vsock CID 2 / TCP fallback
+  # 192.168.122.1, port 9999). A bare connect+close is harmless to the
+  # daemon (EOF path frees the per-connection ctx). Exits 0 — no gating —
+  # unless this VM committed to proxied mode (gpu-status), so the file is
+  # inert on passthrough/CPU modes where ollama runs in Docker.
+  - path: /opt/decloud/gpu-proxy-ready.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      grep -q '^GPU_MODE=proxied' /opt/ollama/gpu-status 2>/dev/null || exit 0
+      exec python3 - <<'PY'
+      import os, socket, sys
+
+      def val(k, d):
+          v = os.environ.get(k)
+          if v:
+              return v
+          try:
+              for line in open('/etc/decloud/gpu-proxy.env'):
+                  line = line.strip()
+                  if line.startswith(k + '='):
+                      return line.split('=', 1)[1].strip().strip('"')
+          except FileNotFoundError:
+              pass
+          return d
+
+      port = int(val('DECLOUD_GPU_PROXY_PORT', '9999'))
+      mode = val('DECLOUD_GPU_PROXY_TRANSPORT', '')
+
+      def vsock():
+          try:
+              s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+              s.settimeout(3)
+              s.connect((int(val('DECLOUD_GPU_PROXY_CID', '2')), port))
+              s.close()
+              return True
+          except OSError:
+              return False
+
+      def tcp():
+          try:
+              s = socket.create_connection(
+                  (val('DECLOUD_GPU_PROXY_HOST', '192.168.122.1'), port), 3)
+              s.close()
+              return True
+          except OSError:
+              return False
+
+      ok = (mode != 'tcp' and vsock()) or (mode != 'vsock' and tcp())
+      sys.exit(0 if ok else 1)
+      PY
+
+  - path: /etc/systemd/system/ollama.service.d/10-decloud-proxy-gate.conf
+    permissions: '0644'
+    content: |
+      [Unit]
+      # Retry-until-precondition unit BY DESIGN: ExecStartPre fails while
+      # the GPU proxy is unreachable and Restart=always retries every
+      # RestartSec=3. Disarm the start-rate limiter so the loop can run
+      # indefinitely (the default 5-starts/10s burst would eventually park
+      # the unit in failed state and defeat the gate).
+      StartLimitIntervalSec=0
+
+      [Service]
+      ExecStartPre=/opt/decloud/gpu-proxy-ready.sh
 
   # ── Provisioning script (base contract v1) ───────────────────────────
   # Executed by decloud-provision.service (base layer) under the base
@@ -405,8 +487,11 @@ write_files:
           fi
 
           systemctl daemon-reload
-          systemctl enable --now ollama
+          # Record the mode BEFORE the first start: the ExecStartPre gate
+          # keys on this file — writing it after enable --now would leave
+          # the very first start (the first-provision race) ungated.
           echo "GPU_MODE=proxied" > /opt/ollama/gpu-status
+          systemctl enable --now ollama
           stamp ollama-running
         fi
         ;;
