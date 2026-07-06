@@ -18,28 +18,22 @@
 #   ${VAR}       — bash runtime expansion inside heredocs / shell scripts
 #                  (NOT a render-time substitution).
 #
-# ── Provisioning model (v2.1: cloud-init configures, systemd heals) ──────
+# ── Provisioning model (v2.2: base contract v1) ──────────────────────────
 #
-# runcmd previously performed multi-GB downloads inline (Ollama tarball,
-# Open WebUI image, llama3.2:3b model). runcmd is one-shot: on slow or lossy
-# links (residential nodes, CGNAT — the majority of a permissionless network)
-# a single stalled TCP connection permanently stranded the VM half-provisioned.
+# The reconciler mechanism (helper library, decloud-provision.service/.timer,
+# well-known status files) is inherited from base-tenant.yaml — see
+# "Provisioning contract (v1)" in that file. This layer supplies only:
+#   * /opt/decloud/provision.sh — the workload phases (sources the library)
+#   * nginx front with a live per-component setup page on "/" and a raw
+#     /health passthrough so the VmReadinessMonitor HttpGet probe stays honest
 #
-# Now:
-#   * cloud-init writes files, configures nginx, and enables a systemd timer.
-#     It finishes in ~1-2 minutes on ANY link, so the "System" readiness
-#     check turns green quickly and per-service checks track the long tail.
-#   * decloud-provision.timer re-runs /opt/decloud/provision-ai-chatbot.sh
-#     every 2 minutes until it converges (level-based reconciliation — the
-#     same shape as SystemVmReconciler, scaled into the guest).
-#   * Every large transfer is MONOTONIC: the Ollama tarball resumes via
-#     curl -C -, docker pulls resume per layer, ollama pull resumes per blob.
-#     Each attempt makes progress; convergence is a matter of time, not luck.
-#   * While provisioning runs, nginx serves a status page on "/" instead of
-#     a bare 502. The "/health" location is deliberately left raw so the
-#     VmReadinessMonitor HttpGet probe stays honest.
+# Every large transfer is MONOTONIC: the Ollama tarball resumes via the
+# library's fetch() (curl -C -, atomic .part rename), docker pulls resume
+# per layer, and the model pull resumes per blob via Ollama's streaming
+# /api/pull. Convergence is a matter of time, not luck — the property that
+# makes this template deploy successfully on residential/Basic-tier links.
 #
-# Trust model (v2.1):
+# ── Trust model (v2.1, unchanged) ────────────────────────────────────────
 #   * Platform boundary — keep the node OPERATOR safe from the tenant VM.
 #     Enforced host-side: KVM isolation, verified base image
 #     (Spec.BaseImageHash), SSH CA, bandwidth QoS. Not this file's job.
@@ -53,10 +47,8 @@
 #   * The Ollama VERSION pin (0.7.0) is a GPU-proxy shim compatibility
 #     constraint (see GPU_PROXY_DEBUGGING_JOURNAL.md Session 16), not a
 #     security control.
-#   * The systemd unit for Ollama is written statically below (content matches
-#     what install.sh 0.7.0 generated — same user, same layout — so the GPU
-#     proxy drop-in and 9p shim permissions behave identically to the
-#     production-verified configuration).
+#   * The status JSON served at /setup-status is unauthenticated by design:
+#     phase names and byte counts only — never env vars, paths, or secrets.
 
 packages:
   # qemu-guest-agent, curl, jq, openssl are provided by base-tenant.yaml.
@@ -67,7 +59,9 @@ packages:
 write_files:
   # ── Provisioning status page ─────────────────────────────────────────
   # Served by nginx (error_page 502 → 503 on "/") while Open WebUI is not
-  # yet up. NOT served on /health — readiness probes must see the raw 502.
+  # yet up. Polls /setup-status (the base-contract JSON) and renders the
+  # per-component list. NOT served on /health — readiness probes must see
+  # the raw 502.
   - path: /opt/decloud/www/decloud-provisioning.html
     permissions: '0644'
     content: |
@@ -75,30 +69,59 @@ write_files:
       <html lang="en">
       <head>
         <meta charset="utf-8">
-        <meta http-equiv="refresh" content="20">
+        <meta http-equiv="refresh" content="60">
         <title>Setting up your AI Chatbot…</title>
         <style>
           body { background:#0f1115; color:#e6e6e6; font-family:system-ui,sans-serif;
                  display:flex; align-items:center; justify-content:center;
                  height:100vh; margin:0; }
-          .card { max-width:34rem; padding:2rem; border:1px solid #2a2e37;
+          .card { max-width:36rem; padding:2rem; border:1px solid #2a2e37;
                   border-radius:12px; background:#161a22; }
           h1 { font-size:1.3rem; margin-top:0; }
           code { background:#0f1115; padding:2px 6px; border-radius:4px; }
           .dim { color:#9aa3b2; font-size:0.9rem; }
+          ul.deps { list-style:none; padding:0; margin:1rem 0; }
+          ul.deps li { display:flex; justify-content:space-between; gap:1rem;
+                       padding:6px 0; border-bottom:1px solid #22262f; }
+          .st-running, .st-ready { color:#5dd39e; }
+          .st-downloading, .st-installing, .st-starting { color:#e8c268; }
+          .st-pending { color:#9aa3b2; }
+          .st-failed { color:#e0685f; }
         </style>
       </head>
       <body>
         <div class="card">
           <h1>&#9203; Your AI Chatbot is still setting up</h1>
-          <p>This VM is downloading Ollama, Open WebUI, and the
-             <code>llama3.2:3b</code> model (several GB in total). On slower
-             connections this can take a while &mdash; downloads resume
-             automatically and always make progress. This page refreshes
-             every 20&nbsp;seconds.</p>
-          <p class="dim">Current step: <a href="/setup-status">/setup-status</a><br>
-             Via SSH: <code>cat /var/lib/decloud/provision-status</code></p>
+          <p>Large downloads are in progress. They resume automatically and
+             always make progress, even on slow connections.</p>
+          <ul class="deps" id="deps"><li><span>loading status…</span></li></ul>
+          <p class="dim">Via SSH: <code>cat /var/lib/decloud/provision-status</code></p>
         </div>
+        <script>
+          // Status JSON is guest-written display data; render via textContent
+          // only (never innerHTML) so it cannot inject markup.
+          async function poll() {
+            try {
+              const r = await fetch('/setup-status', {cache: 'no-store'});
+              const j = await r.json();
+              const ul = document.getElementById('deps');
+              ul.replaceChildren();
+              for (const c of (j.components || [])) {
+                const li = document.createElement('li');
+                const name = document.createElement('span');
+                name.textContent = c.name;
+                const st = document.createElement('span');
+                st.textContent = c.state + (c.detail ? ' — ' + c.detail : '');
+                st.className = 'st-' + c.state;
+                li.append(name, st);
+                ul.append(li);
+              }
+              if ((j.components || []).every(c => c.state === 'running' || c.state === 'ready')
+                  && (j.components || []).length > 0) location.reload();
+            } catch (e) { /* JSON not written yet — keep polling */ }
+          }
+          poll(); setInterval(poll, 5000);
+        </script>
       </body>
       </html>
 
@@ -108,7 +131,8 @@ write_files:
   # /health  → RAW proxy to the upstream health endpoint. No fallback here:
   #            VmReadinessMonitor's HttpGet probe must observe the real 502
   #            until Open WebUI is actually up. Do not add error_page.
-  # /setup-status → plaintext provisioning phase (phase names only, no secrets).
+  # /setup-status → the base-contract component JSON (phase names and byte
+  #            counts only — no secrets; unauthenticated by design).
   - path: /etc/nginx/sites-available/ai-chatbot
     permissions: '0644'
     content: |
@@ -122,8 +146,8 @@ write_files:
           }
 
           location = /setup-status {
-              alias /var/lib/decloud/provision-status;
-              default_type text/plain;
+              alias /var/lib/decloud/provision-status.json;
+              default_type application/json;
           }
 
           location = /decloud-provisioning.html {
@@ -172,59 +196,21 @@ write_files:
       [Install]
       WantedBy=default.target
 
-  # ── Provisioning service + timer ─────────────────────────────────────
-  # The timer is the retry boundary. No retry counters, no sleep loops:
-  # the script exits non-zero at the first incomplete phase, systemd marks
-  # the oneshot inactive, and the timer re-fires 2 minutes later. systemd
-  # will not start the service while a previous run is still active, so
-  # long downloads never overlap. ConditionPathExists makes the whole unit
-  # a no-op forever once the final stamp exists. Persistent=true +
-  # OnBootSec make provisioning survive reboots and live migration.
-  - path: /etc/systemd/system/decloud-provision.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=DeCloud AI Chatbot provisioning (idempotent, resumable)
-      ConditionPathExists=!/var/lib/decloud/ai-chatbot.provisioned
-      Wants=network-online.target
-      After=network-online.target
-
-      [Service]
-      Type=oneshot
-      # Multi-GB downloads on slow links: never kill an in-progress run.
-      TimeoutStartSec=infinity
-      ExecStart=/opt/decloud/provision-ai-chatbot.sh
-
-  - path: /etc/systemd/system/decloud-provision.timer
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Re-run AI Chatbot provisioning until it converges
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitInactiveSec=2min
-      Persistent=true
-
-      [Install]
-      WantedBy=timers.target
-
-  # ── Provisioning script ──────────────────────────────────────────────
-  # Idempotent and phase-stamped. Each phase: skip if stamped → do → stamp.
-  # Every large transfer resumes, so each timer pass strictly extends
-  # progress. GPU mode dispatch and the Mode-2 shim logic are carried over
-  # verbatim from v2.0 (see GPU_PROXY_DEBUGGING_JOURNAL.md Session 16 /
-  # Problem 17 — design intent preserved).
-  - path: /opt/decloud/provision-ai-chatbot.sh
+  # ── Provisioning script (base contract v1) ───────────────────────────
+  # Executed by decloud-provision.service (base layer) under the base
+  # timer. Idempotent and phase-stamped via the base library. GPU mode
+  # dispatch and the Mode-2 shim logic carried over verbatim from v2.0
+  # (GPU_PROXY_DEBUGGING_JOURNAL.md Session 16 / Problem 17 — design
+  # intent preserved).
+  - path: /opt/decloud/provision.sh
     permissions: '0755'
     content: |
       #!/bin/bash
       set -euo pipefail
+      . /opt/decloud/lib/provision.sh
+      trap 'status "step failed — timer retries in 2min (journalctl -u decloud-provision)"' ERR
 
-      STAMPS=/var/lib/decloud/stamps
-      DL=/opt/decloud/dl
-      STATUS_FILE=/var/lib/decloud/provision-status
-      mkdir -p "$STAMPS" "$DL" /opt/ollama /opt/open-webui
+      mkdir -p /opt/ollama /opt/open-webui
 
       OLLAMA_VERSION=0.7.0
       # Pin to 0.7.0 — see GPU_PROXY_DEBUGGING_JOURNAL.md Session 16 (Bug 23).
@@ -233,13 +219,39 @@ write_files:
       # the graceful fallback path the shim relies on.
       OLLAMA_TGZ_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-amd64.tgz"
       # No content-hash pinning — deliberate; see "Trust model" in the file
-      # header. Completeness is still enforced (curl -f, .part rename, gzip CRC).
+      # header. Completeness is enforced by the library's fetch().
       OPEN_WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
+      MODEL="llama3.2:3b"
 
-      status() { echo "$1" > "$STATUS_FILE"; logger -t decloud-provision "$1"; }
-      trap 'status "step failed — timer retries in 2min (journalctl -u decloud-provision)"' ERR
-      stamped() { [ -f "$STAMPS/$1" ]; }
-      stamp()   { touch "$STAMPS/$1"; }
+      # Declare components up front so the setup page shows the full plan
+      # from the first poll (idempotent — states advance on later passes).
+      stamped ollama-running   || component "ollama"        pending
+      stamped webui-running    || component "open-webui"    pending
+      stamped model            || component "model $MODEL"  pending
+
+      # pull_model <model> <component> — stream Ollama's /api/pull and
+      # relay byte progress. The API is the machine-readable boundary
+      # (never scrape CLI output). Works identically for native and
+      # Docker modes — both expose 11434. Blobs resume server-side, so
+      # interrupted pulls also make monotonic progress. Success is
+      # verified via /api/show, not by parsing the stream tail.
+      pull_model() {
+        local model="$1" comp="$2" n=0 line completed total
+        curl -sN -X POST http://localhost:11434/api/pull -d "{\"name\":\"$model\"}" \
+        | while IFS= read -r line; do
+            if echo "$line" | jq -e '.error? // empty' >/dev/null 2>&1; then
+              component "$comp" failed "$(echo "$line" | jq -r '.error' | head -c 120)"
+              exit 1
+            fi
+            n=$((n + 1)); [ $((n % 25)) -ne 0 ] && continue
+            completed=$(echo "$line" | jq -r '.completed // empty')
+            total=$(echo "$line" | jq -r '.total // empty')
+            if [ -n "$completed" ] && [ -n "$total" ]; then
+              component "$comp" downloading "$((completed / 1048576)) MB / $((total / 1048576)) MB"
+            fi
+          done
+        curl -sf -X POST http://localhost:11434/api/show -d "{\"name\":\"$model\"}" >/dev/null
+      }
 
       # ── GPU mode dispatch (unchanged detection logic from v2.0) ──────
       #   passthrough: physical NVIDIA GPU → Ollama in Docker with --gpus=all
@@ -265,6 +277,7 @@ write_files:
         # ── Mode 1: Physical NVIDIA GPU (passthrough / bare-metal) ──
         if ! stamped nvidia-toolkit; then
           status "installing nvidia container toolkit"
+          component "ollama" installing "nvidia container toolkit"
           apt-get update
           apt-get install -y ubuntu-drivers-common
           ubuntu-drivers autoinstall || true
@@ -283,11 +296,13 @@ write_files:
         fi
         if ! stamped ollama-running; then
           status "pulling ollama image (resumes per layer)"
+          component "ollama" downloading "image pull, resumes per layer"
           docker pull ollama/ollama:latest
           docker rm -f ollama 2>/dev/null || true
           docker run -d --name ollama --restart unless-stopped --gpus=all \
             -v /opt/ollama:/root/.ollama -p 11434:11434 ollama/ollama:latest
           echo "GPU_MODE=passthrough" > /opt/ollama/gpu-status
+          component "ollama" running "GPU passthrough, Docker"
           stamp ollama-running
         fi
         ;;
@@ -298,17 +313,10 @@ write_files:
         # GPU discovery can't find it inside Docker containers.
         if ! stamped ollama-binary; then
           TGZ="$DL/ollama-linux-amd64-${OLLAMA_VERSION}.tgz"
-          if [ ! -f "$TGZ" ]; then
-            status "downloading ollama ${OLLAMA_VERSION} (resumable — extends partial file)"
-            # Completeness via atomic rename: download to .part, rename only on
-            # curl exit 0 (server-reported length fully received). The final
-            # filename existing IS the completeness marker — a truncated file
-            # can never reach tar (the v2.0 failure mode).
-            # -C -: every timer pass extends the partial file monotonically.
-            curl -fL -C - --retry 3 --retry-all-errors -o "$TGZ.part" "$OLLAMA_TGZ_URL"
-            mv "$TGZ.part" "$TGZ"
-          fi
+          status "downloading ollama ${OLLAMA_VERSION} (resumable)"
+          fetch "$OLLAMA_TGZ_URL" "$TGZ" "ollama"
           status "installing ollama ${OLLAMA_VERSION}"
+          component "ollama" installing "${OLLAMA_VERSION} native"
           # gzip CRC catches on-disk corruption at extraction; discard the
           # artifact and let the timer re-download rather than loop on it.
           tar -C /usr/local -xzf "$TGZ" || { rm -f "$TGZ"; exit 1; }
@@ -373,6 +381,7 @@ write_files:
 
         if ! stamped ollama-running; then
           status "configuring + starting ollama (GPU proxy)"
+          component "ollama" starting "GPU proxy, native"
           # ── Inject GPU proxy env vars into the Ollama systemd service ──
           mkdir -p /etc/systemd/system/ollama.service.d
           GPCONF=/etc/systemd/system/ollama.service.d/gpu-proxy.conf
@@ -406,27 +415,35 @@ write_files:
         # ── Mode 3: No GPU — Ollama in Docker (CPU-only) ──
         if ! stamped ollama-running; then
           status "pulling ollama image (CPU mode, resumes per layer)"
+          component "ollama" downloading "image pull, resumes per layer"
           docker pull ollama/ollama:latest
           docker rm -f ollama 2>/dev/null || true
           docker run -d --name ollama --restart unless-stopped \
             -v /opt/ollama:/root/.ollama -p 11434:11434 ollama/ollama:latest
           echo "GPU_MODE=false" > /opt/ollama/gpu-status
+          component "ollama" running "CPU, Docker"
           stamp ollama-running
         fi
         ;;
       esac
 
       # ── Phase: Open WebUI image ───────────────────────────────────────
-      # Ordered before the model pull so the UI (with its provisioning-aware
-      # nginx front) becomes interactive as early as possible.
+      # Ordered before the model pull so the UI (with its provisioning-
+      # aware nginx front) becomes interactive as early as possible.
+      # Byte-level progress is deliberately not reported here: parsing
+      # `docker pull` terminal output is output-scraping; the honest
+      # machine-readable boundary would be the Engine API socket — adopt
+      # that if byte progress is ever needed.
       if ! stamped webui-image; then
         status "pulling Open WebUI image (resumes per layer)"
+        component "open-webui" downloading "image pull, resumes per layer"
         docker pull "$OPEN_WEBUI_IMAGE"
         stamp webui-image
       fi
 
       if ! stamped webui-running; then
         status "starting Open WebUI"
+        component "open-webui" starting
         # WEBUI_SECRET_KEY uses __ADMIN_PASSWORD__ — substituted by the
         # orchestrator at render time. Same value as the root password,
         # generated per-deploy.
@@ -444,6 +461,7 @@ write_files:
           -e ENABLE_COMMUNITY_SHARING=false \
           -p 3000:8080 \
           "$OPEN_WEBUI_IMAGE"
+        component "open-webui" running
         stamp webui-running
       fi
 
@@ -453,41 +471,30 @@ write_files:
       if ! stamped model; then
         if ! curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
           status "waiting for ollama api — timer retries in 2min"
+          component "model $MODEL" pending "waiting for ollama api"
           exit 1
         fi
-        status "pulling llama3.2:3b (resumes per blob)"
-        export HOME=/root
-        if command -v ollama >/dev/null 2>&1; then
-          ollama pull llama3.2:3b
-        else
-          docker exec ollama ollama pull llama3.2:3b
-        fi
+        component "ollama" running
+        status "pulling $MODEL (resumes per blob)"
+        pull_model "$MODEL" "model $MODEL"
+        component "model $MODEL" ready
         stamp model
       fi
 
       # ── Converged ─────────────────────────────────────────────────────
-      rm -f "$DL"/*.tgz "$DL"/get-docker.sh
-      touch /var/lib/decloud/ai-chatbot.provisioned
-      status "complete"
+      rm -f "$DL"/*.tgz "$DL"/get-docker.sh 2>/dev/null || true
+      provision_done
 
 runcmd:
-  # Fast, local, deterministic work only — no downloads. Cloud-init finishes
-  # in ~1-2 minutes on any link; heavy provisioning runs under the timer.
-  - mkdir -p /opt/ollama /opt/open-webui /var/lib/decloud/stamps /opt/decloud/dl
-  - echo "queued — provisioning starts within 2 minutes" > /var/lib/decloud/provision-status
+  # Workload configuration only — the provisioning reconciler is armed by
+  # base-tenant.yaml runcmd (which executes BEFORE these role entries and
+  # runs concurrently with them by design). No downloads here.
 
   # ── Nginx reverse proxy (config delivered via write_files) ──────────
   - rm -f /etc/nginx/sites-enabled/default
   - ln -sf /etc/nginx/sites-available/ai-chatbot /etc/nginx/sites-enabled/ai-chatbot
   - nginx -t && systemctl restart nginx
   - systemctl enable nginx
-
-  # ── Arm the provisioning reconciler ──────────────────────────────────
-  # --no-block on the first kick: cloud-init must NOT wait for multi-GB
-  # downloads. The timer covers every subsequent retry and reboot.
-  - systemctl daemon-reload
-  - systemctl enable --now decloud-provision.timer
-  - systemctl start --no-block decloud-provision.service
 
   # ── Welcome message ────────────────────────────────────────────────────
   # __DECLOUD_DOMAIN__ and __ADMIN_PASSWORD__ are substituted at render time.
@@ -530,8 +537,9 @@ final_message: |
   Username: user / Password: __ADMIN_PASSWORD__
 
   Default model: llama3.2:3b — downloading in the background.
-  Your chat URL shows a live setup page until everything is ready.
-  Downloads resume automatically, even on slow connections.
+  Your chat URL shows a live setup page with per-component progress
+  until everything is ready. Downloads resume automatically, even on
+  slow connections.
 
   Check progress via SSH:
     cat /var/lib/decloud/provision-status

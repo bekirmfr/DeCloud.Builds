@@ -7,9 +7,42 @@
 #   - Universal hostname / password / SSH key handling
 #   - SSH Certificate Authority setup
 #   - QEMU guest agent for orchestrator monitoring
+#   - Provisioning contract (v1): helper library, reconciler units, and the
+#     well-known status files — see "Provisioning contract" below.
 #
 # This file is NOT deployed standalone. It is merged with a role layer
 # (e.g. tenant-vms/general/cloud-init.yaml) by the orchestrator at seed time.
+#
+# ── Provisioning contract (v1) ───────────────────────────────────────────
+#
+# Role layers that need multi-step / large-download provisioning write ONE
+# executable script to /opt/decloud/provision.sh (0755) that sources
+# /opt/decloud/lib/provision.sh. The base layer supplies everything else:
+#
+#   * decloud-provision.timer re-runs the script every 2 minutes until
+#     /var/lib/decloud/provisioned exists (level-based reconciliation —
+#     the same shape as SystemVmReconciler, scaled into the guest). The
+#     script exits non-zero at the first incomplete phase; the timer
+#     re-fires. systemd never overlaps runs of the same oneshot unit.
+#   * ConditionPathExists on the service makes the whole mechanism a
+#     silent no-op on VMs whose role ships no provision.sh — the
+#     filesystem state is the flag; there is no per-template toggle.
+#   * Well-known status files (the contract platform code may read):
+#       /var/lib/decloud/provision-status        one-line human phase
+#       /var/lib/decloud/provision-status.json   {"version":1,"components":[...]}
+#     Both are written by helpers in the library. Content is GUEST-
+#     CONTROLLED and therefore untrusted: any platform consumer
+#     (VmReadinessMonitor → Service.StatusMessage) must length-cap,
+#     escape on render, and treat it as display-only — never as a
+#     control input.
+#
+# Base-owned paths — role layers MUST NOT redeclare these in write_files.
+# TemplateComposer concatenates write_files base-first, so a role file with
+# the same path is written AFTER base and silently wins on disk (shadowing,
+# not a collision the composer can detect):
+#   /opt/decloud/lib/provision.sh
+#   /etc/systemd/system/decloud-provision.service
+#   /etc/systemd/system/decloud-provision.timer
 
 hostname: __HOSTNAME__
 manage_etc_hosts: true
@@ -76,7 +109,8 @@ ssh_pwauth: __SSH_PASSWORD_AUTH__
 
 # Essential packages.
 # qemu-guest-agent: required for orchestrator monitoring of every tenant VM.
-# curl, jq, openssl: required by the artifact-fetch pipeline (runcmd below).
+# curl, jq, openssl: required by the artifact-fetch pipeline (runcmd below)
+# and by the provisioning library (component() uses jq; fetch() uses curl).
 packages:
   - qemu-guest-agent
   - curl
@@ -112,6 +146,121 @@ write_files:
     permissions: '0644'
     content: __ORCHESTRATOR_URL__
 
+  # ── Provisioning helper library (contract v1) ────────────────────────
+  # Sourced by role-layer /opt/decloud/provision.sh scripts. Provides the
+  # phase-stamp idiom, the status-file writers, and a resumable atomic
+  # fetch. Base-owned — role layers must not redeclare this path.
+  - path: /opt/decloud/lib/provision.sh
+    permissions: '0644'
+    content: |
+      #!/bin/bash
+      # DeCloud provisioning library — contract v1. Source, do not execute.
+      # Callers set their own `set -euo pipefail` and ERR trap, e.g.:
+      #   trap 'status "step failed — timer retries in 2min"' ERR
+
+      STAMPS=/var/lib/decloud/stamps
+      DL=/opt/decloud/dl
+      STATUS_FILE=/var/lib/decloud/provision-status
+      STATUS_JSON=/var/lib/decloud/provision-status.json
+      PROVISIONED=/var/lib/decloud/provisioned
+      mkdir -p "$STAMPS" "$DL"
+
+      # One-line human-readable phase. Mirrored to syslog for journalctl.
+      status() { echo "$1" > "$STATUS_FILE"; logger -t decloud-provision "$1"; }
+
+      # Phase stamps: skip if stamped → do → stamp. The idempotency idiom
+      # that makes timer re-runs safe and cheap.
+      stamped() { [ -f "$STAMPS/$1" ]; }
+      stamp()   { touch "$STAMPS/$1"; }
+
+      # component <name> <state> [detail] — upsert one component entry in
+      # STATUS_JSON. States: pending|downloading|installing|starting|
+      # running|ready|failed. Consumers must treat all fields as untrusted
+      # display text (guest-controlled). Updated entries move to the end.
+      component() {
+        local name="$1" state="$2" detail="${3:-}" tmp
+        [ -f "$STATUS_JSON" ] || echo '{"version":1,"components":[]}' > "$STATUS_JSON"
+        tmp=$(mktemp)
+        jq --arg n "$name" --arg s "$state" --arg d "$detail" \
+           '.components |= (map(select(.name != $n)) + [{"name":$n,"state":$s,"detail":$d}])' \
+           "$STATUS_JSON" > "$tmp" && mv "$tmp" "$STATUS_JSON"
+      }
+
+      # fetch <url> <dest> [component] — resumable download with atomic
+      # completion rename. Completeness by construction: bytes land in
+      # $dest.part; the final name appears only after curl exit 0, so a
+      # truncated transfer can never be consumed. -C - makes every timer
+      # pass extend the partial file monotonically — the property that
+      # guarantees convergence on slow links.
+      # With [component], reports "N MB / M MB" progress every 10s from
+      # stat(1) against one HEAD Content-Length — no output scraping.
+      fetch() {
+        local url="$1" dest="$2" comp="${3:-}" total="" pid got
+        [ -f "$dest" ] && return 0
+        if [ -n "$comp" ]; then
+          total=$(curl -sIL --max-time 30 "$url" | awk 'tolower($1)=="content-length:"{cl=$2} END{gsub("\r","",cl); print cl}')
+          curl -fL -C - --retry 3 --retry-all-errors -o "$dest.part" "$url" &
+          pid=$!
+          while kill -0 "$pid" 2>/dev/null; do
+            sleep 10
+            got=$(stat -c%s "$dest.part" 2>/dev/null || echo 0)
+            if [ -n "$total" ] && [ "$total" -gt 0 ] 2>/dev/null; then
+              component "$comp" downloading "$((got / 1048576)) MB / $((total / 1048576)) MB"
+            else
+              component "$comp" downloading "$((got / 1048576)) MB"
+            fi
+          done
+          wait "$pid" || return 1
+        else
+          curl -fL -C - --retry 3 --retry-all-errors -o "$dest.part" "$url"
+        fi
+        mv "$dest.part" "$dest"
+      }
+
+      # provision_done — final stamp. ConditionPathExists on the service
+      # turns every future timer fire into a no-op.
+      provision_done() {
+        rm -f "$DL"/*.part 2>/dev/null || true
+        touch "$PROVISIONED"
+        status "complete"
+      }
+
+  # ── Provisioning reconciler units (contract v1) ──────────────────────
+  # The timer is the retry boundary: no retry counters, no sleep loops in
+  # scripts. Base-owned — role layers must not redeclare these paths.
+  - path: /etc/systemd/system/decloud-provision.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud role provisioning (idempotent, resumable)
+      # No role provision script → condition fails → silent no-op. The
+      # filesystem is the flag; there is no per-template toggle.
+      ConditionPathExists=/opt/decloud/provision.sh
+      # Converged → no-op forever.
+      ConditionPathExists=!/var/lib/decloud/provisioned
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      # Multi-GB downloads on slow links: never kill an in-progress run.
+      TimeoutStartSec=infinity
+      ExecStart=/opt/decloud/provision.sh
+
+  - path: /etc/systemd/system/decloud-provision.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Re-run DeCloud role provisioning until it converges
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitInactiveSec=2min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
 # Runtime commands.
 runcmd:
   # Start QEMU guest agent (static unit — systemctl enable fails silently,
@@ -137,5 +286,18 @@ runcmd:
 
   # Reload SSH to apply CA key and principals config (SIGHUP — no port downtime).
   - systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+
+  # ── Arm the provisioning reconciler (contract v1) ────────────────────
+  # Runs on EVERY tenant VM; both units are condition-gated so this is a
+  # free no-op when the role ships no /opt/decloud/provision.sh.
+  # --no-block on the first kick: cloud-init must never wait on downloads.
+  # Note runcmd ordering: base entries (these) run BEFORE role entries —
+  # write_files has already delivered the role's provision.sh by now, so
+  # the condition sees it. Role runcmd must not assume provisioning has
+  # finished (it runs concurrently by design).
+  - mkdir -p /var/lib/decloud
+  - systemctl daemon-reload
+  - systemctl enable --now decloud-provision.timer
+  - systemctl start --no-block decloud-provision.service
 
 final_message: "DeCloud VM __VM_NAME__ is ready!"
