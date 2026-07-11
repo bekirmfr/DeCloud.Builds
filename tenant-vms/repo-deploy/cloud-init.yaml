@@ -1,0 +1,452 @@
+#cloud-config
+
+# DeCloud "Deploy from Repository" Role Layer
+#
+# Composed with base-tenant.yaml by TemplateComposer at seed time to form
+# the platform-repo-deploy VmTemplate.
+#
+# Contract: give me a URL to your source and the port your app listens on,
+# and I will make it reachable at your VM's address. Build detection is
+# fixed-precedence and not configurable: Dockerfile → docker compose →
+# Nixpacks. If detection guesses wrong, add a Dockerfile to your repo.
+# This template does not rebuild on push, host a second app, or provide
+# a dashboard. For a full PaaS control plane, deploy the Coolify template.
+#
+# SECURITY DESIGN — no user byte is ever parsed as YAML:
+#   Every user-controlled value reaches this file base64-encoded inside
+#   exactly three render-time placeholders (__DEPLOY_CONF_B64__,
+#   __APP_ENV_B64__, __DEPLOY_KEY_B64__), each landing in a write_files
+#   entry with `encoding: b64`. A newline, quote, or YAML directive in a
+#   user value therefore cannot alter the composed document. The
+#   orchestrator never fetches or inspects the repository URL — the clone
+#   happens inside the guest, where untrusted code is already the
+#   expected condition (no SSRF surface on the orchestrator).
+#
+#   The rendered cloud-init (including these values) is written to the
+#   hosting node's disk. The node operator can read it. The deploy form
+#   discloses this. Private-repo credentials are therefore restricted to
+#   read-only single-repo deploy keys, deleted from the guest after clone.
+#
+# Provisioning follows contract v1 (base-tenant.yaml): the systemd timer
+# is the retry boundary — no retry counters, no sleep loops. Every phase
+# is stamped; source download uses the library's resumable fetch() where
+# a tarball URL exists, so convergence on slow links is a matter of time,
+# not luck. `git clone` (non-GitHub/GitLab hosts) is the acknowledged
+# lucky-path fallback: it restarts from zero on interruption.
+#
+# This file is NOT deployed standalone.
+
+write_files:
+  # ── Deploy configuration (user-supplied, base64-armored) ─────────────
+  # KEY='value' lines, shell-quoted client-side by repo-deploy.js.
+  # Consumed only by provision.sh via `. $CONF` — never by cloud-init.
+  - path: /etc/decloud/deploy.conf
+    permissions: '0600'
+    encoding: b64
+    content: __DEPLOY_CONF_B64__
+
+  # ── Application environment (user-supplied, base64-armored) ──────────
+  # Plain KEY=value lines. Passed verbatim to `docker run --env-file`.
+  # Root-only on disk; the app process receives it as its environment.
+  - path: /etc/decloud/app.env
+    permissions: '0600'
+    encoding: b64
+    content: __APP_ENV_B64__
+
+  # ── Optional deploy key (user-supplied, base64-armored) ──────────────
+  # Read-only single-repo SSH key for private clones. provision.sh
+  # validates the PEM header, uses it once, and deletes it.
+  - path: /root/.ssh/decloud_deploy_key
+    permissions: '0600'
+    encoding: b64
+    content: __DEPLOY_KEY_B64__
+
+  # ── Provisioning script (contract v1 role script) ────────────────────
+  - path: /opt/decloud/provision.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # DeCloud repo-deploy provisioning. Idempotent: safe to re-run every
+      # 2 minutes until provision_done. Exits non-zero at the first
+      # incomplete phase; the timer re-fires.
+      set -euo pipefail
+      source /opt/decloud/lib/provision.sh
+
+      PHASE=init
+      on_err() {
+        status "phase '$PHASE' failed — timer retries in 2min"
+        component "$PHASE" failed "see /var/log/decloud/build.log over SSH"
+        # If the app never took port 80, make sure the status page is up
+        # so the user isn't staring at a connection refused.
+        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx app; then
+          systemctl start repo-status 2>/dev/null || true
+        fi
+      }
+      trap on_err ERR
+
+      mkdir -p /var/log/decloud /opt/app
+      LOG=/var/log/decloud/build.log
+      # Full build output goes to the log, readable over SSH only.
+      # The status page shows phase names and counters — never build
+      # output, which routinely echoes environment variables.
+      exec >>"$LOG" 2>&1
+      echo "── provision run $(date -Is) ──"
+
+      CONF=/etc/decloud/deploy.conf
+      [ -s "$CONF" ] || { status "deploy.conf missing or empty"; exit 1; }
+      # shellcheck disable=SC1090
+      . "$CONF"
+      : "${SOURCE_URL:?SOURCE_URL missing from deploy.conf}"
+      SOURCE_REF=${SOURCE_REF:-HEAD}
+      APP_PORT=${APP_PORT:-8080}
+      DATABASE=${DATABASE:-none}
+
+      # ── phase: docker ────────────────────────────────────────────────
+      PHASE=docker
+      if ! stamped docker; then
+        component docker installing; status "installing docker"
+        curl -fsSL https://get.docker.com | sh
+        systemctl enable --now docker
+        docker network inspect appnet >/dev/null 2>&1 || docker network create appnet
+        stamp docker; component docker ready
+      fi
+
+      # ── phase: source ────────────────────────────────────────────────
+      # Tarball-first: GitHub/GitLab archives ride the library's fetch()
+      # (resumable, atomic). Anything else falls back to git clone.
+      PHASE=source
+      SRC=/opt/app/src
+      if ! stamped source; then
+        component source downloading; status "fetching source"
+        rm -rf "$SRC"
+        TARBALL=""
+        case "$SOURCE_URL" in
+          https://github.com/*)
+            REPO_PATH=${SOURCE_URL#https://github.com/}; REPO_PATH=${REPO_PATH%.git}; REPO_PATH=${REPO_PATH%/}
+            TARBALL="https://codeload.github.com/$REPO_PATH/tar.gz/$SOURCE_REF" ;;
+          https://gitlab.com/*)
+            REPO_PATH=${SOURCE_URL#https://gitlab.com/}; REPO_PATH=${REPO_PATH%.git}; REPO_PATH=${REPO_PATH%/}
+            NAME=${REPO_PATH##*/}
+            TARBALL="https://gitlab.com/$REPO_PATH/-/archive/$SOURCE_REF/$NAME-$SOURCE_REF.tar.gz" ;;
+        esac
+
+        KEY=/root/.ssh/decloud_deploy_key
+        HAVE_KEY=false
+        if [ -s "$KEY" ] && grep -q "BEGIN" "$KEY"; then HAVE_KEY=true; fi
+
+        if [ -n "$TARBALL" ] && [ "$HAVE_KEY" = false ]; then
+          fetch "$TARBALL" "$DL/src.tgz" source
+          mkdir -p "$SRC"
+          tar -xzf "$DL/src.tgz" -C "$SRC" --strip-components=1
+        else
+          # Private repo or non-GitHub/GitLab host: git clone into a
+          # staging dir, atomic mv on success (monotonic-ish: a killed
+          # clone restarts, but a half-clone is never consumed).
+          apt-get install -y git >/dev/null 2>&1 || true
+          rm -rf "$SRC.part"
+          CLONE_URL=$SOURCE_URL
+          GITSSH=""
+          if [ "$HAVE_KEY" = true ]; then
+            GITSSH="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            # https://host/owner/repo → git@host:owner/repo for key auth
+            case "$CLONE_URL" in
+              https://*)
+                HOSTPATH=${CLONE_URL#https://}
+                CLONE_URL="git@${HOSTPATH%%/*}:${HOSTPATH#*/}" ;;
+            esac
+          fi
+          if [ "$SOURCE_REF" = "HEAD" ]; then
+            GIT_SSH_COMMAND="$GITSSH" git clone --depth 1 "$CLONE_URL" "$SRC.part"
+          else
+            # Branch or tag: shallow. Commit SHA: full clone + checkout.
+            GIT_SSH_COMMAND="$GITSSH" git clone --depth 1 --branch "$SOURCE_REF" "$CLONE_URL" "$SRC.part" \
+              || { GIT_SSH_COMMAND="$GITSSH" git clone "$CLONE_URL" "$SRC.part" \
+                   && git -C "$SRC.part" checkout "$SOURCE_REF"; }
+          fi
+          mv "$SRC.part" "$SRC"
+        fi
+
+        # Deploy key has done its one job. It does not outlive the clone.
+        rm -f "$KEY"
+
+        # Record what we actually built — reproducibility, not integrity
+        # (in-guest content verification is the tenant's job by design).
+        if [ -d "$SRC/.git" ]; then
+          git -C "$SRC" rev-parse HEAD > /etc/decloud/source-sha 2>/dev/null || true
+        fi
+        stamp source; component source ready
+      fi
+
+      # ── phase: database (optional) ───────────────────────────────────
+      PHASE=database
+      if [ "$DATABASE" != "none" ] && ! stamped database; then
+        component database starting; status "starting $DATABASE"
+        DBENV=/etc/decloud/db.env
+        case "$DATABASE" in
+          postgres)
+            if [ ! -f "$DBENV" ]; then
+              printf "DB_PASS=%s\n" "$(openssl rand -hex 16)" > "$DBENV"; chmod 600 "$DBENV"
+            fi
+            . "$DBENV"
+            docker rm -f appdb >/dev/null 2>&1 || true
+            docker run -d --name appdb --restart unless-stopped --network appnet \
+              -e POSTGRES_PASSWORD="$DB_PASS" -e POSTGRES_DB=app \
+              -v pgdata:/var/lib/postgresql/data postgres:16
+            grep -q '^DATABASE_URL=' /etc/decloud/app.env 2>/dev/null || \
+              printf "DATABASE_URL=postgres://postgres:%s@appdb:5432/app\n" "$DB_PASS" >> /etc/decloud/app.env
+            ;;
+          redis)
+            docker rm -f appdb >/dev/null 2>&1 || true
+            docker run -d --name appdb --restart unless-stopped --network appnet \
+              -v redisdata:/data redis:7
+            grep -q '^REDIS_URL=' /etc/decloud/app.env 2>/dev/null || \
+              printf "REDIS_URL=redis://appdb:6379\n" >> /etc/decloud/app.env
+            ;;
+          *) echo "unknown DATABASE '$DATABASE' — skipping" ;;
+        esac
+        stamp database; component database ready
+      fi
+
+      # ── phase: build ─────────────────────────────────────────────────
+      # Fixed precedence. Detection is delegated, never owned: Nixpacks
+      # already reads Procfiles and infers Node/Python/Go/Rust/etc.
+      PHASE=build
+      COMPOSE_FILE=""
+      for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
+        [ -f "$SRC/$f" ] && { COMPOSE_FILE=$f; break; }
+      done
+      if ! stamped build; then
+        status "building application"
+        if [ -f "$SRC/Dockerfile" ]; then
+          component build installing "docker build"
+          docker build -t app:latest "$SRC"
+        elif [ -n "$COMPOSE_FILE" ]; then
+          component build installing "docker compose build"
+          (cd "$SRC" && docker compose -f "$COMPOSE_FILE" build)
+        else
+          component build installing "nixpacks"
+          if ! command -v nixpacks >/dev/null 2>&1; then
+            # Pinned release binary, resumable fetch, no pipe-to-shell.
+            # NIXPACKS_VERSION: verify the asset name against the release
+            # page before first seed; bump deliberately thereafter.
+            NIXPACKS_VERSION=1.29.1
+            fetch "https://github.com/railwayapp/nixpacks/releases/download/v$NIXPACKS_VERSION/nixpacks-v$NIXPACKS_VERSION-x86_64-unknown-linux-musl.tar.gz" \
+              "$DL/nixpacks.tgz" build
+            tar -xzf "$DL/nixpacks.tgz" -C /usr/local/bin nixpacks
+            chmod +x /usr/local/bin/nixpacks
+          fi
+          nixpacks build "$SRC" --name app:latest
+        fi
+        stamp build; component build ready
+      fi
+
+      # ── phase: run ───────────────────────────────────────────────────
+      PHASE=run
+      if ! stamped run; then
+        component app starting; status "starting application"
+        # The status page has been holding port 80. Hand it over.
+        systemctl stop repo-status 2>/dev/null || true
+        systemctl disable repo-status 2>/dev/null || true
+        if [ -n "$COMPOSE_FILE" ]; then
+          # Compose apps own their own port mapping; the repo's compose
+          # file must publish port 80 (documented on the deploy form).
+          (cd "$SRC" && docker compose -f "$COMPOSE_FILE" up -d)
+        else
+          docker rm -f app >/dev/null 2>&1 || true
+          docker run -d --name app --restart unless-stopped --network appnet \
+            -p 80:"$APP_PORT" -e PORT="$APP_PORT" \
+            --env-file /etc/decloud/app.env app:latest
+        fi
+        stamp run; component app running
+      fi
+
+      provision_done
+
+  # ── Build-status page (read-only, unauthenticated by design) ─────────
+  # Serves 503 + progress HTML on / while provisioning so the platform's
+  # port-80 readiness check stays honest, and /status as length-capped
+  # JSON. Shows phase names and byte counts only — the full build log
+  # stays at /var/log/decloud/build.log, readable over SSH. Stopped by
+  # provision.sh the moment the app takes port 80.
+  - path: /opt/decloud/status/server.py
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env python3
+      """DeCloud repo-deploy build-status server. Read-only."""
+      import http.server, socketserver, os
+
+      PORT = 80
+      HTML = "/opt/decloud/status/index.html"
+      STATUS_JSON = "/var/lib/decloud/provision-status.json"
+      MAX_JSON = 16384  # length-capped: guest-written, display-only
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              if self.path == "/status":
+                  try:
+                      with open(STATUS_JSON, "rb") as f:
+                          data = f.read(MAX_JSON)
+                  except OSError:
+                      data = b'{"version":1,"components":[]}'
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Cache-Control", "no-store")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+                  return
+              # Everything else: the progress page, as 503 — honest
+              # "not ready yet" to readiness probes, rendered fine by
+              # browsers.
+              try:
+                  with open(HTML, "rb") as f:
+                      body = f.read()
+              except OSError:
+                  body = b"<h1>Provisioning...</h1>"
+              self.send_response(503)
+              self.send_header("Content-Type", "text/html; charset=utf-8")
+              self.send_header("Retry-After", "10")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, *args):
+              pass
+
+      with socketserver.TCPServer(("", PORT), Handler) as httpd:
+          httpd.allow_reuse_address = True
+          httpd.serve_forever()
+
+  - path: /opt/decloud/status/index.html
+    permissions: '0644'
+    content: |
+      <!DOCTYPE html>
+      <html>
+      <head>
+          <title>Building…</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+          <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                  font-family: 'Outfit', -apple-system, sans-serif;
+                  min-height: 100vh; display: flex; justify-content: center;
+                  align-items: center; background: #0a0b0f; color: #f0f2f5;
+              }
+              body::before {
+                  content: ''; position: fixed; inset: 0; z-index: 0;
+                  background-image: linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+                                    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+                  background-size: 60px 60px; pointer-events: none;
+              }
+              .card {
+                  background: #12141a; padding: 3rem; border-radius: 24px;
+                  border: 1px solid rgba(255,255,255,0.1); max-width: 520px;
+                  width: calc(100% - 2rem); position: relative; z-index: 1;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+              }
+              h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }
+              .sub { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
+              .step {
+                  display: flex; align-items: center; gap: 0.75rem;
+                  padding: 0.6rem 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+                  font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
+              }
+              .step:last-child { border-bottom: none; }
+              .step .name { color: #f0f2f5; min-width: 90px; }
+              .step .detail { color: #6b7280; font-size: 0.75rem; margin-left: auto; }
+              .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+              .pending .dot { background: #374151; }
+              .active  .dot { background: #00d4aa; animation: pulse 1.5s infinite;
+                              box-shadow: 0 0 8px rgba(0,212,170,0.5); }
+              .ready   .dot { background: #00d4aa; }
+              .failed  .dot { background: #ef4444; }
+              .failed .name, .failed .detail { color: #ef4444; }
+              @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+              .note {
+                  margin-top: 1.5rem; padding: 1rem; background: #1a1d26;
+                  border: 1px solid rgba(255,255,255,0.06); border-radius: 10px;
+                  font-size: 0.78rem; color: #6b7280; line-height: 1.6;
+              }
+              code {
+                  background: #0a0b0f; padding: 0.15rem 0.4rem; border-radius: 6px;
+                  font-size: 0.72rem; color: #f59e0b;
+                  font-family: 'JetBrains Mono', monospace;
+              }
+          </style>
+      </head>
+      <body>
+          <div class="card">
+              <h1>Building your app</h1>
+              <p class="sub">This page hands over to your application when the build finishes.</p>
+              <div id="steps"></div>
+              <div class="note">
+                  Full build log: <code>ssh root@your-vm</code> then
+                  <code>tail -f /var/log/decloud/build.log</code>.
+                  Failed builds retry automatically every 2 minutes.
+              </div>
+          </div>
+          <script>
+              const STATES = { downloading:'active', installing:'active', starting:'active',
+                               running:'ready', ready:'ready', failed:'failed', pending:'pending' };
+              const esc = s => String(s).replace(/[&<>"']/g,
+                  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+              async function poll() {
+                  try {
+                      const r = await fetch('/status', { cache: 'no-store' });
+                      const j = await r.json();
+                      const comps = Array.isArray(j.components) ? j.components : [];
+                      document.getElementById('steps').innerHTML = comps.map(c => {
+                          const cls = STATES[c.state] || 'pending';
+                          return '<div class="step ' + cls + '"><span class="dot"></span>' +
+                                 '<span class="name">' + esc(c.name) + '</span>' +
+                                 '<span class="detail">' + esc(c.detail || c.state) + '</span></div>';
+                      }).join('');
+                      // App took port 80 → this server is gone next poll;
+                      // reload lands on the real application.
+                      if (comps.some(c => c.name === 'app' && c.state === 'running')) {
+                          setTimeout(() => location.reload(), 3000);
+                      }
+                  } catch (e) {
+                      // Status server stopped — the app owns 80 now.
+                      setTimeout(() => location.reload(), 2000);
+                      return;
+                  }
+                  setTimeout(poll, 3000);
+              }
+              poll();
+          </script>
+      </body>
+      </html>
+
+  - path: /etc/systemd/system/repo-status.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=DeCloud repo-deploy build status page
+      After=network.target
+      # Once provisioned, never come back — the app owns port 80.
+      ConditionPathExists=!/var/lib/decloud/provisioned
+
+      [Service]
+      ExecStart=/opt/decloud/status/server.py
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Role entries run AFTER base entries (TemplateComposer ListConcat,
+  # base-first) — the provisioning timer is already armed by the time
+  # these run. Direct symlink instead of systemctl enable, consistent
+  # with the qemu-guest-agent pattern in base-tenant.
+  - ln -sf /etc/systemd/system/repo-status.service /etc/systemd/system/multi-user.target.wants/repo-status.service
+  - systemctl start repo-status
+
+final_message: |
+  DeCloud VM __VM_NAME__ is up. Your repository is building now —
+  open https://__DECLOUD_DOMAIN__ to watch progress. The page hands
+  over to your app automatically when the build completes.
