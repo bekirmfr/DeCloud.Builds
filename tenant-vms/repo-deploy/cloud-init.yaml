@@ -281,8 +281,17 @@ write_files:
       app_state() { docker inspect -f '{{.State.Status}}' app 2>/dev/null || echo missing; }
       if ! stamped run; then
         component app starting; status "starting application"
+        # Stop the status page and wait for it to actually release port 80.
+        # `systemctl stop` returns before the socket is fully freed, and
+        # `docker run` binding a still-closing port fails and leaves a
+        # stale daemon binding. With Restart=on-failure the stop sticks;
+        # this bounded wait closes the socket-release race. Not a fix-by-
+        # sleep — it waits on a known in-progress teardown, then proceeds.
         systemctl stop repo-status 2>/dev/null || true
-        systemctl disable repo-status 2>/dev/null || true
+        for _ in $(seq 1 10); do
+          ss -ltn 2>/dev/null | grep -q ':80 ' || break
+          sleep 1
+        done
 
         if [ -n "$COMPOSE_FILE" ]; then
           (cd "$SRC" && docker compose -f "$COMPOSE_FILE" up -d)
@@ -502,7 +511,15 @@ write_files:
 
       [Service]
       ExecStart=/opt/decloud/status/server.py
-      Restart=always
+      # on-failure (NOT always): provision.sh stops this deliberately to
+      # hand port 80 to the app. Restart=always respawned it 2s later and
+      # raced `docker run` for the port — the first run failed with "port
+      # in use" and left a stale daemon binding that blocked every retry.
+      # on-failure means a deliberate `stop` stays stopped (clean handoff),
+      # while a genuine crash still self-heals. The failure paths in
+      # provision.sh `systemctl start` it again explicitly, which works
+      # because the unit is never masked.
+      Restart=on-failure
       RestartSec=2
 
       [Install]
