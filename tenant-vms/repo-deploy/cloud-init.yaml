@@ -208,8 +208,21 @@ write_files:
       fi
 
       # ── phase: build ─────────────────────────────────────────────────
-      # Fixed precedence. Detection is delegated, never owned: Nixpacks
-      # already reads Procfiles and infers Node/Python/Go/Rust/etc.
+      # Fixed precedence: Dockerfile → compose → Nixpacks. Detection is
+      # delegated, never owned (Nixpacks reads Procfiles and infers the
+      # language). Precedence is deliberate — a Dockerfile is the user's
+      # most explicit build instruction, so it wins.
+      #
+      # We do NOT auto-fall-back from a failed Dockerfile to Nixpacks:
+      # silently building something OTHER than what the repo's Dockerfile
+      # specifies is a worse surprise than failing. But the failure must
+      # not be mute. When the Dockerfile path fails, we say so specifically
+      # and point at the real boundary — "your Dockerfile broke; remove it
+      # to let auto-detection (Nixpacks) try instead" — because a repo can
+      # carry a broken Dockerfile over a working Procfile/Nixpacks path
+      # (the confetti case), and the actionable fix is a repo change the
+      # user can only make if we tell them the Dockerfile was the cause.
+      # The chosen builder is recorded for support/debugging.
       PHASE=build
       COMPOSE_FILE=""
       for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
@@ -218,12 +231,24 @@ write_files:
       if ! stamped build; then
         status "building application"
         if [ -f "$SRC/Dockerfile" ]; then
+          echo dockerfile > /etc/decloud/build-method
           component build installing "docker build"
-          docker build -t app:latest "$SRC"
+          if ! docker build -t app:latest "$SRC"; then
+            # Specific, actionable failure. Disable the ERR trap first so
+            # the generic "phase failed" handler can't overwrite it.
+            trap - ERR
+            component build failed \
+              "Dockerfile build failed — fix the Dockerfile, or remove it to auto-detect the build (Nixpacks). Log: /var/log/decloud/build.log"
+            status "Dockerfile build failed — see build.log; remove Dockerfile to try auto-detect (timer retries in 2min)"
+            systemctl start repo-status 2>/dev/null || true
+            exit 1
+          fi
         elif [ -n "$COMPOSE_FILE" ]; then
+          echo compose > /etc/decloud/build-method
           component build installing "docker compose build"
           (cd "$SRC" && docker compose -f "$COMPOSE_FILE" build)
         else
+          echo nixpacks > /etc/decloud/build-method
           component build installing "nixpacks"
           if ! command -v nixpacks >/dev/null 2>&1; then
             # Pinned release binary, resumable fetch, no pipe-to-shell.
@@ -241,15 +266,25 @@ write_files:
       fi
 
       # ── phase: run ───────────────────────────────────────────────────
+      # docker run -d returns when the container STARTS, not when it
+      # SERVES. So confirm port 80 actually answers before declaring
+      # success, and report the two failure modes distinctly — they need
+      # opposite user actions:
+      #   app failed      → image built but the container won't stay up
+      #                     (bad start command, crash on boot) → fix repo
+      #   app unreachable → container is up but nothing answers on 80
+      #                     (app listening on a port other than APP_PORT,
+      #                     or bound to 127.0.0.1 inside) → fix APP_PORT
+      # Only a confirmed 80-responds reaches provision_done, so the
+      # platform's Port-80 health check and the guest's status agree.
       PHASE=run
+      app_state() { docker inspect -f '{{.State.Status}}' app 2>/dev/null || echo missing; }
       if ! stamped run; then
         component app starting; status "starting application"
-        # The status page has been holding port 80. Hand it over.
         systemctl stop repo-status 2>/dev/null || true
         systemctl disable repo-status 2>/dev/null || true
+
         if [ -n "$COMPOSE_FILE" ]; then
-          # Compose apps own their own port mapping; the repo's compose
-          # file must publish port 80 (documented on the deploy form).
           (cd "$SRC" && docker compose -f "$COMPOSE_FILE" up -d)
         else
           docker rm -f app >/dev/null 2>&1 || true
@@ -257,7 +292,39 @@ write_files:
             -p 80:"$APP_PORT" -e PORT="$APP_PORT" \
             --env-file /etc/decloud/app.env app:latest
         fi
-        stamp run; component app running
+
+        # Readiness confirmation — NOT a retry loop. A freshly-started
+        # container needs a few seconds to bind its port; this waits on a
+        # known-in-progress operation. Bounded to ~30s; the 2-min timer
+        # stays the retry boundary for the phase as a whole.
+        ready=false
+        for _ in $(seq 1 15); do
+          if curl -fsS -m 3 -o /dev/null "http://localhost:80/" 2>/dev/null; then
+            ready=true; break
+          fi
+          case "$(app_state)" in running) ;; *) break ;; esac
+          sleep 2
+        done
+
+        if [ "$ready" = true ]; then
+          stamp run; component app running
+        else
+          # Disable the ERR trap so these specific, actionable messages
+          # aren't overwritten by the generic "phase failed" handler.
+          trap - ERR
+          docker logs --tail 40 app >> "$LOG" 2>&1 || true
+          systemctl start repo-status 2>/dev/null || true
+          if [ "$(app_state)" = running ]; then
+            component app unreachable \
+              "container is up but nothing answered on port 80 — is your app listening on APP_PORT=$APP_PORT?"
+            status "app unreachable on port 80 — check APP_PORT (timer retries in 2min)"
+          else
+            component app failed \
+              "container exited on start — see /var/log/decloud/build.log over SSH"
+            status "app container exited — check your start command (timer retries in 2min)"
+          fi
+          exit 1
+        fi
       fi
 
       provision_done
@@ -364,6 +431,8 @@ write_files:
               .ready   .dot { background: #00d4aa; }
               .failed  .dot { background: #ef4444; }
               .failed .name, .failed .detail { color: #ef4444; }
+              .warn    .dot { background: #f59e0b; }
+              .warn .name, .warn .detail { color: #f59e0b; }
               @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
               .note {
                   margin-top: 1.5rem; padding: 1rem; background: #1a1d26;
@@ -390,7 +459,8 @@ write_files:
           </div>
           <script>
               const STATES = { downloading:'active', installing:'active', starting:'active',
-                               running:'ready', ready:'ready', failed:'failed', pending:'pending' };
+                               running:'ready', ready:'ready', failed:'failed',
+                               unreachable:'warn', pending:'pending' };
               const esc = s => String(s).replace(/[&<>"']/g,
                   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
               async function poll() {
