@@ -2,7 +2,8 @@
 
 One-shot deploy from source. The user supplies a repository URL, the port
 their app listens on, optional env vars, an optional database, and an
-optional deploy key. The VM builds the code and serves it on port 80.
+optional deploy key. The VM builds the code, runs it on an internal port,
+and serves it at the VM's address on port 80 via an nginx front proxy.
 
 **Positioning.** This template deliberately does not rebuild on push, host a
 second app, or ship a dashboard. Coolify is the control plane; this is the
@@ -52,27 +53,47 @@ Phases: `docker` → `source` → `database` → `build` → `run`.
   (pinned release binary via `fetch()`, no pipe-to-shell). Detection is
   delegated, never owned. The override for a wrong guess is "add a
   Dockerfile", not a form field.
-- **run**: the status server releases port 80, then
-  `docker run -p 80:$APP_PORT -e PORT=$APP_PORT --env-file /etc/decloud/app.env`.
-  Compose apps map their own ports and must publish 80 (documented on the
-  form). Port 80 is the only exposed port by design — the moment a second
-  port is wanted, the answer is Coolify, not port machinery here.
+- **run**: the app runs on an internal port only —
+  `docker run -p 127.0.0.1:3000:$APP_PORT -e PORT=$APP_PORT --env-file /etc/decloud/app.env`.
+  It never binds port 80; nginx owns 80 and proxies to `127.0.0.1:3000`
+  (see "Front proxy" below). The run phase confirms the app answers on
+  3000 before stamping success, and distinguishes "container exited" (fix
+  your repo) from "up but silent on the port" (fix `APP_PORT`).
+  **Compose apps must publish port 3000**, not 80 — nginx proxies to it.
+  Port 80 is the only externally exposed port by design; the moment a
+  second app or port is wanted, the answer is Coolify, not port machinery
+  here.
 
 Full build output goes to `/var/log/decloud/build.log` (SSH only). The
 status page shows phase names and byte counts, never build output — build
 logs routinely echo environment variables, and the page is unauthenticated
 by design.
 
-## Status page
+## Front proxy (why there is no port-80 handoff)
 
-`repo-status.service` serves the progress page on port 80 **as HTTP 503**
-(honest "not ready" to the platform's port-80 readiness probe; browsers
-render it fine) and `/status` as length-capped JSON from
-`provision-status.json` (guest-written, display-only, escaped client-side).
-`provision.sh` stops the service when the app takes port 80;
-`ConditionPathExists=!/var/lib/decloud/provisioned` keeps it from ever
-coming back. On a failed `run` phase the ERR trap restarts it so the user
-is never staring at connection-refused.
+nginx owns port 80 for the VM's whole life and proxies to the app on
+`127.0.0.1:3000`. While the app is down, nginx serves the build-status
+page via `error_page 502 503 504 =503 /decloud-provisioning.html`; the
+instant the app answers on 3000, nginx proxies straight through to it.
+There is no stop, no handoff, no second binder of port 80.
+
+This replaced a v1 design where a status server bound 80 directly and was
+stopped to "hand off" the port to the app. That handoff was an unfixable
+race: the status server could respawn between the port check and the app's
+bind, and once any `docker run -p 80` failed mid-network-setup, dockerd
+held a stale host-port reservation that `docker rm` did not release and
+`ss` could not see — poisoning every retry until `systemctl restart
+docker`. Because nothing but nginx now binds 80, and the app binds only
+`127.0.0.1:3000`, both failure modes are structurally impossible rather
+than merely handled.
+
+- `/` → the app, with the provisioning page shown on 502/503/504.
+- `/health` → **raw** passthrough to the app, no `error_page` fallback, so
+  the platform's Port-80 readiness probe observes the real upstream state
+  (502 until the app is up). Do not add a fallback to this location.
+- `/decloud-status` → length-capped JSON from `provision-status.json`
+  (guest-written, display-only; the status page escapes it client-side and
+  inserts via `textContent`, never `innerHTML`).
 
 ## Updating
 
