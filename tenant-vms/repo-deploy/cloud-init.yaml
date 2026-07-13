@@ -1,6 +1,6 @@
 #cloud-config
 
-# DeCloud "Deploy from Repository" Role Layer
+# DeCloud "Deploy from Repository" Role Layer (v2 — proxy pattern)
 #
 # Composed with base-tenant.yaml by TemplateComposer at seed time to form
 # the platform-repo-deploy VmTemplate.
@@ -11,6 +11,33 @@
 # Nixpacks. If detection guesses wrong, add a Dockerfile to your repo.
 # This template does not rebuild on push, host a second app, or provide
 # a dashboard. For a full PaaS control plane, deploy the Coolify template.
+#
+# ── Why v2 (proxy pattern) ───────────────────────────────────────────────
+# v1 had the app bind host port 80 directly, and a status page that also
+# bound 80 and was stopped to "hand off" the port. That handoff was a race
+# that could not be refereed: the status page could respawn between the
+# port-check and the app's bind, and once ANY `docker run -p 80` failed
+# mid-network-setup, dockerd held a stale host-port reservation that
+# `docker rm` did not release and `ss` could not see — poisoning every
+# retry until a manual `systemctl restart docker`. Two incremental fixes
+# (Restart=on-failure, a port-release wait) each addressed one holder of
+# the port and missed another.
+#
+# v2 removes the handoff entirely, matching the ai-chatbot template's
+# proven design:
+#   * nginx owns port 80 for the VM's whole life and never yields it.
+#   * The app runs on an INTERNAL port (127.0.0.1:__RUNPORT__), so it
+#     never contends for 80 and dockerd never makes a stale :80 reservation.
+#   * While the app is down, nginx serves the build-status page via
+#     `error_page 502 =503`. The instant the app is up, nginx proxies to
+#     it — no stop, no respawn, no timing.
+#   * /health is a RAW passthrough so the platform's Port-80 readiness
+#     probe observes the real upstream state (502 until the app answers).
+# There is no port race because there is no second binder of port 80.
+#
+# As a bonus this retires the v1 compose-port footgun: a compose app no
+# longer has to publish exactly port 80; it publishes __RUNPORT__ and
+# nginx proxies to it.
 #
 # SECURITY DESIGN — no user byte is ever parsed as YAML:
 #   Every user-controlled value reaches this file base64-encoded inside
@@ -30,11 +57,13 @@
 # Provisioning follows contract v1 (base-tenant.yaml): the systemd timer
 # is the retry boundary — no retry counters, no sleep loops. Every phase
 # is stamped; source download uses the library's resumable fetch() where
-# a tarball URL exists, so convergence on slow links is a matter of time,
-# not luck. `git clone` (non-GitHub/GitLab hosts) is the acknowledged
-# lucky-path fallback: it restarts from zero on interruption.
+# a tarball URL exists.
 #
 # This file is NOT deployed standalone.
+
+packages:
+  # qemu-guest-agent, curl, jq, openssl are provided by base-tenant.yaml.
+  - nginx
 
 write_files:
   # ── Deploy configuration (user-supplied, base64-armored) ─────────────
@@ -61,26 +90,190 @@ write_files:
     encoding: b64
     content: __DEPLOY_KEY_B64__
 
+  # ── nginx front (owns port 80 permanently) ───────────────────────────
+  # /        → the app on 127.0.0.1:3000, with the build-status page shown
+  #            via error_page 502/503/504 while the app is not yet up.
+  # /health  → RAW passthrough to the app. No error_page fallback here:
+  #            the platform's Port-80 HttpGet readiness probe must observe
+  #            the real 502 until the app actually answers. Do NOT add a
+  #            fallback to this location.
+  # /decloud-status → the base-contract component JSON (phase names and
+  #            byte counts only — no secrets; unauthenticated by design).
+  - path: /etc/nginx/sites-available/repo-deploy
+    permissions: '0644'
+    content: |
+      server {
+          listen 80 default_server;
+          server_name _;
+          client_max_body_size 100M;
+
+          # Readiness probe target — raw upstream state, no fallback.
+          location = /health {
+              proxy_pass http://127.0.0.1:3000/health;
+              proxy_connect_timeout 3s;
+          }
+
+          # Build-status JSON for the provisioning page (guest-written,
+          # display-only, length is capped by the writer).
+          location = /decloud-status {
+              alias /var/lib/decloud/provision-status.json;
+              default_type application/json;
+              add_header Cache-Control "no-store";
+          }
+
+          location = /decloud-provisioning.html {
+              root /opt/decloud/www;
+              internal;
+          }
+
+          # Everything else → the app. While the app is down (502/503/504),
+          # show the provisioning page instead of a raw gateway error.
+          location / {
+              proxy_pass http://127.0.0.1:3000;
+              error_page 502 503 504 =503 /decloud-provisioning.html;
+              proxy_intercept_errors on;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_read_timeout 600s;
+              proxy_send_timeout 600s;
+          }
+      }
+
+  # ── Build-status page (served by nginx while the app is down) ────────
+  # Polls /decloud-status and renders the per-component list. Never binds
+  # a port itself — nginx serves it via error_page. Shows phase names and
+  # byte counts only; the full build log stays at /var/log/decloud/
+  # build.log (SSH only), because build output routinely echoes env vars.
+  - path: /opt/decloud/www/decloud-provisioning.html
+    permissions: '0644'
+    content: |
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="30">
+          <title>Building your app…</title>
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+          <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                  font-family: 'Outfit', -apple-system, sans-serif;
+                  min-height: 100vh; display: flex; justify-content: center;
+                  align-items: center; background: #0a0b0f; color: #f0f2f5;
+              }
+              body::before {
+                  content: ''; position: fixed; inset: 0; z-index: 0;
+                  background-image: linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+                                    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+                  background-size: 60px 60px; pointer-events: none;
+              }
+              .card {
+                  background: #12141a; padding: 3rem; border-radius: 24px;
+                  border: 1px solid rgba(255,255,255,0.1); max-width: 520px;
+                  width: calc(100% - 2rem); position: relative; z-index: 1;
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+              }
+              h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }
+              .sub { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
+              .step {
+                  display: flex; align-items: center; gap: 0.75rem;
+                  padding: 0.6rem 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+                  font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
+              }
+              .step:last-child { border-bottom: none; }
+              .step .name { color: #f0f2f5; min-width: 90px; }
+              .step .detail { color: #6b7280; font-size: 0.75rem; margin-left: auto; }
+              .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+              .pending .dot { background: #374151; }
+              .active  .dot { background: #00d4aa; animation: pulse 1.5s infinite;
+                              box-shadow: 0 0 8px rgba(0,212,170,0.5); }
+              .ready   .dot { background: #00d4aa; }
+              .failed  .dot { background: #ef4444; }
+              .failed .name, .failed .detail { color: #ef4444; }
+              .warn    .dot { background: #f59e0b; }
+              .warn .name, .warn .detail { color: #f59e0b; }
+              @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+              .note {
+                  margin-top: 1.5rem; padding: 1rem; background: #1a1d26;
+                  border: 1px solid rgba(255,255,255,0.06); border-radius: 10px;
+                  font-size: 0.78rem; color: #6b7280; line-height: 1.6;
+              }
+              code {
+                  background: #0a0b0f; padding: 0.15rem 0.4rem; border-radius: 6px;
+                  font-size: 0.72rem; color: #f59e0b;
+                  font-family: 'JetBrains Mono', monospace;
+              }
+          </style>
+      </head>
+      <body>
+          <div class="card">
+              <h1>Building your app</h1>
+              <p class="sub">This page becomes your application the moment the build finishes.</p>
+              <div id="steps"></div>
+              <div class="note">
+                  Full build log: <code>ssh root@your-vm</code> then
+                  <code>tail -f /var/log/decloud/build.log</code>.
+                  Failed builds retry automatically every 2 minutes.
+              </div>
+          </div>
+          <script>
+              const STATES = { downloading:'active', installing:'active', starting:'active',
+                               running:'ready', ready:'ready', failed:'failed',
+                               unreachable:'warn', pending:'pending' };
+              // Status JSON is guest-written display data; escape and set via
+              // textContent only (never innerHTML) so it cannot inject markup.
+              const esc = s => String(s).replace(/[&<>"']/g,
+                  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+              async function poll() {
+                  try {
+                      const r = await fetch('/decloud-status', { cache: 'no-store' });
+                      const j = await r.json();
+                      const comps = Array.isArray(j.components) ? j.components : [];
+                      document.getElementById('steps').innerHTML = comps.map(c => {
+                          const cls = STATES[c.state] || 'pending';
+                          return '<div class="step ' + cls + '"><span class="dot"></span>' +
+                                 '<span class="name">' + esc(c.name) + '</span>' +
+                                 '<span class="detail">' + esc(c.detail || c.state) + '</span></div>';
+                      }).join('');
+                      // App running → next request proxies through to it.
+                      if (comps.some(c => c.name === 'app' && c.state === 'running')) {
+                          setTimeout(() => location.reload(), 3000);
+                      }
+                  } catch (e) { /* status not written yet — keep polling */ }
+                  setTimeout(poll, 3000);
+              }
+              poll();
+          </script>
+      </body>
+      </html>
+
   # ── Provisioning script (contract v1 role script) ────────────────────
   - path: /opt/decloud/provision.sh
     permissions: '0755'
     content: |
       #!/bin/bash
-      # DeCloud repo-deploy provisioning. Idempotent: safe to re-run every
-      # 2 minutes until provision_done. Exits non-zero at the first
-      # incomplete phase; the timer re-fires.
+      # DeCloud repo-deploy provisioning (v2, proxy pattern). Idempotent:
+      # safe to re-run every 2 minutes until provision_done. Exits non-zero
+      # at the first incomplete phase; the timer re-fires.
       set -euo pipefail
       source /opt/decloud/lib/provision.sh
+
+      # The app runs on this internal port; nginx proxies 80 → here. The
+      # app never binds 80, so it can never contend for it and dockerd can
+      # never make a stale :80 reservation. This is the whole fix.
+      RUNPORT=3000
 
       PHASE=init
       on_err() {
         status "phase '$PHASE' failed — timer retries in 2min"
         component "$PHASE" failed "see /var/log/decloud/build.log over SSH"
-        # If the app never took port 80, make sure the status page is up
-        # so the user isn't staring at a connection refused.
-        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx app; then
-          systemctl start repo-status 2>/dev/null || true
-        fi
       }
       trap on_err ERR
 
@@ -209,20 +402,10 @@ write_files:
 
       # ── phase: build ─────────────────────────────────────────────────
       # Fixed precedence: Dockerfile → compose → Nixpacks. Detection is
-      # delegated, never owned (Nixpacks reads Procfiles and infers the
-      # language). Precedence is deliberate — a Dockerfile is the user's
-      # most explicit build instruction, so it wins.
-      #
-      # We do NOT auto-fall-back from a failed Dockerfile to Nixpacks:
-      # silently building something OTHER than what the repo's Dockerfile
-      # specifies is a worse surprise than failing. But the failure must
-      # not be mute. When the Dockerfile path fails, we say so specifically
-      # and point at the real boundary — "your Dockerfile broke; remove it
-      # to let auto-detection (Nixpacks) try instead" — because a repo can
-      # carry a broken Dockerfile over a working Procfile/Nixpacks path
-      # (the confetti case), and the actionable fix is a repo change the
-      # user can only make if we tell them the Dockerfile was the cause.
-      # The chosen builder is recorded for support/debugging.
+      # delegated, never owned. Precedence is deliberate — a Dockerfile is
+      # the user's most explicit build instruction, so it wins. We do NOT
+      # auto-fall-back from a failed Dockerfile to Nixpacks; instead the
+      # failure is made legible (below) so "fix your repo" is actionable.
       PHASE=build
       COMPOSE_FILE=""
       for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
@@ -234,13 +417,10 @@ write_files:
           echo dockerfile > /etc/decloud/build-method
           component build installing "docker build"
           if ! docker build -t app:latest "$SRC"; then
-            # Specific, actionable failure. Disable the ERR trap first so
-            # the generic "phase failed" handler can't overwrite it.
             trap - ERR
             component build failed \
               "Dockerfile build failed — fix the Dockerfile, or remove it to auto-detect the build (Nixpacks). Log: /var/log/decloud/build.log"
             status "Dockerfile build failed — see build.log; remove Dockerfile to try auto-detect (timer retries in 2min)"
-            systemctl start repo-status 2>/dev/null || true
             exit 1
           fi
         elif [ -n "$COMPOSE_FILE" ]; then
@@ -266,49 +446,42 @@ write_files:
       fi
 
       # ── phase: run ───────────────────────────────────────────────────
-      # docker run -d returns when the container STARTS, not when it
-      # SERVES. So confirm port 80 actually answers before declaring
-      # success, and report the two failure modes distinctly — they need
-      # opposite user actions:
-      #   app failed      → image built but the container won't stay up
-      #                     (bad start command, crash on boot) → fix repo
-      #   app unreachable → container is up but nothing answers on 80
-      #                     (app listening on a port other than APP_PORT,
-      #                     or bound to 127.0.0.1 inside) → fix APP_PORT
-      # Only a confirmed 80-responds reaches provision_done, so the
-      # platform's Port-80 health check and the guest's status agree.
+      # The app binds an INTERNAL port only (127.0.0.1:$RUNPORT). nginx
+      # already owns 80 and proxies to it. No handoff, no port race, no
+      # possibility of a stale dockerd :80 reservation.
+      #
+      # `docker run -d` returns when the container STARTS, not when it
+      # SERVES. Confirm the app answers on $RUNPORT before declaring
+      # success, and report the two failure modes distinctly:
+      #   app failed      → container won't stay up (crash on boot) → fix repo
+      #   app unreachable → container up but silent on $RUNPORT
+      #                     (app listening on a port other than APP_PORT) → fix APP_PORT
+      # Only a confirmed-serving app reaches provision_done, so nginx's /health
+      # passthrough and the guest's status agree.
       PHASE=run
       app_state() { docker inspect -f '{{.State.Status}}' app 2>/dev/null || echo missing; }
       if ! stamped run; then
         component app starting; status "starting application"
-        # Stop the status page and wait for it to actually release port 80.
-        # `systemctl stop` returns before the socket is fully freed, and
-        # `docker run` binding a still-closing port fails and leaves a
-        # stale daemon binding. With Restart=on-failure the stop sticks;
-        # this bounded wait closes the socket-release race. Not a fix-by-
-        # sleep — it waits on a known in-progress teardown, then proceeds.
-        systemctl stop repo-status 2>/dev/null || true
-        for _ in $(seq 1 10); do
-          ss -ltn 2>/dev/null | grep -q ':80 ' || break
-          sleep 1
-        done
 
         if [ -n "$COMPOSE_FILE" ]; then
+          # Compose apps map their own ports; the repo's compose file must
+          # publish $RUNPORT (3000). Documented on the deploy form.
           (cd "$SRC" && docker compose -f "$COMPOSE_FILE" up -d)
         else
           docker rm -f app >/dev/null 2>&1 || true
+          # Bind to 127.0.0.1:$RUNPORT — reachable by nginx, never exposed
+          # directly, never touching 80.
           docker run -d --name app --restart unless-stopped --network appnet \
-            -p 80:"$APP_PORT" -e PORT="$APP_PORT" \
+            -p 127.0.0.1:"$RUNPORT":"$APP_PORT" -e PORT="$APP_PORT" \
             --env-file /etc/decloud/app.env app:latest
         fi
 
         # Readiness confirmation — NOT a retry loop. A freshly-started
-        # container needs a few seconds to bind its port; this waits on a
-        # known-in-progress operation. Bounded to ~30s; the 2-min timer
-        # stays the retry boundary for the phase as a whole.
+        # container needs a few seconds to bind; this waits on a known
+        # in-progress operation, then the 2-min timer is the retry boundary.
         ready=false
         for _ in $(seq 1 15); do
-          if curl -fsS -m 3 -o /dev/null "http://localhost:80/" 2>/dev/null; then
+          if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:$RUNPORT/" 2>/dev/null; then
             ready=true; break
           fi
           case "$(app_state)" in running) ;; *) break ;; esac
@@ -322,11 +495,10 @@ write_files:
           # aren't overwritten by the generic "phase failed" handler.
           trap - ERR
           docker logs --tail 40 app >> "$LOG" 2>&1 || true
-          systemctl start repo-status 2>/dev/null || true
           if [ "$(app_state)" = running ]; then
             component app unreachable \
-              "container is up but nothing answered on port 80 — is your app listening on APP_PORT=$APP_PORT?"
-            status "app unreachable on port 80 — check APP_PORT (timer retries in 2min)"
+              "container is up but nothing answered on port $APP_PORT — is your app listening on APP_PORT=$APP_PORT?"
+            status "app unreachable — check APP_PORT (timer retries in 2min)"
           else
             component app failed \
               "container exited on start — see /var/log/decloud/build.log over SSH"
@@ -338,202 +510,49 @@ write_files:
 
       provision_done
 
-  # ── Build-status page (read-only, unauthenticated by design) ─────────
-  # Serves 503 + progress HTML on / while provisioning so the platform's
-  # port-80 readiness check stays honest, and /status as length-capped
-  # JSON. Shows phase names and byte counts only — the full build log
-  # stays at /var/log/decloud/build.log, readable over SSH. Stopped by
-  # provision.sh the moment the app takes port 80.
-  - path: /opt/decloud/status/server.py
-    permissions: '0755'
-    content: |
-      #!/usr/bin/env python3
-      """DeCloud repo-deploy build-status server. Read-only."""
-      import http.server, socketserver, os
-
-      PORT = 80
-      HTML = "/opt/decloud/status/index.html"
-      STATUS_JSON = "/var/lib/decloud/provision-status.json"
-      MAX_JSON = 16384  # length-capped: guest-written, display-only
-
-      class Handler(http.server.BaseHTTPRequestHandler):
-          def do_GET(self):
-              if self.path == "/status":
-                  try:
-                      with open(STATUS_JSON, "rb") as f:
-                          data = f.read(MAX_JSON)
-                  except OSError:
-                      data = b'{"version":1,"components":[]}'
-                  self.send_response(200)
-                  self.send_header("Content-Type", "application/json")
-                  self.send_header("Cache-Control", "no-store")
-                  self.send_header("Content-Length", str(len(data)))
-                  self.end_headers()
-                  self.wfile.write(data)
-                  return
-              # Everything else: the progress page, as 503 — honest
-              # "not ready yet" to readiness probes, rendered fine by
-              # browsers.
-              try:
-                  with open(HTML, "rb") as f:
-                      body = f.read()
-              except OSError:
-                  body = b"<h1>Provisioning...</h1>"
-              self.send_response(503)
-              self.send_header("Content-Type", "text/html; charset=utf-8")
-              self.send_header("Retry-After", "10")
-              self.send_header("Content-Length", str(len(body)))
-              self.end_headers()
-              self.wfile.write(body)
-
-          def log_message(self, *args):
-              pass
-
-      with socketserver.TCPServer(("", PORT), Handler) as httpd:
-          httpd.allow_reuse_address = True
-          httpd.serve_forever()
-
-  - path: /opt/decloud/status/index.html
-    permissions: '0644'
-    content: |
-      <!DOCTYPE html>
-      <html>
-      <head>
-          <title>Building…</title>
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <link rel="preconnect" href="https://fonts.googleapis.com">
-          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-          <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-          <style>
-              * { margin: 0; padding: 0; box-sizing: border-box; }
-              body {
-                  font-family: 'Outfit', -apple-system, sans-serif;
-                  min-height: 100vh; display: flex; justify-content: center;
-                  align-items: center; background: #0a0b0f; color: #f0f2f5;
-              }
-              body::before {
-                  content: ''; position: fixed; inset: 0; z-index: 0;
-                  background-image: linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
-                                    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
-                  background-size: 60px 60px; pointer-events: none;
-              }
-              .card {
-                  background: #12141a; padding: 3rem; border-radius: 24px;
-                  border: 1px solid rgba(255,255,255,0.1); max-width: 520px;
-                  width: calc(100% - 2rem); position: relative; z-index: 1;
-                  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-              }
-              h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; }
-              .sub { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
-              .step {
-                  display: flex; align-items: center; gap: 0.75rem;
-                  padding: 0.6rem 0; border-bottom: 1px solid rgba(255,255,255,0.05);
-                  font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
-              }
-              .step:last-child { border-bottom: none; }
-              .step .name { color: #f0f2f5; min-width: 90px; }
-              .step .detail { color: #6b7280; font-size: 0.75rem; margin-left: auto; }
-              .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-              .pending .dot { background: #374151; }
-              .active  .dot { background: #00d4aa; animation: pulse 1.5s infinite;
-                              box-shadow: 0 0 8px rgba(0,212,170,0.5); }
-              .ready   .dot { background: #00d4aa; }
-              .failed  .dot { background: #ef4444; }
-              .failed .name, .failed .detail { color: #ef4444; }
-              .warn    .dot { background: #f59e0b; }
-              .warn .name, .warn .detail { color: #f59e0b; }
-              @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-              .note {
-                  margin-top: 1.5rem; padding: 1rem; background: #1a1d26;
-                  border: 1px solid rgba(255,255,255,0.06); border-radius: 10px;
-                  font-size: 0.78rem; color: #6b7280; line-height: 1.6;
-              }
-              code {
-                  background: #0a0b0f; padding: 0.15rem 0.4rem; border-radius: 6px;
-                  font-size: 0.72rem; color: #f59e0b;
-                  font-family: 'JetBrains Mono', monospace;
-              }
-          </style>
-      </head>
-      <body>
-          <div class="card">
-              <h1>Building your app</h1>
-              <p class="sub">This page hands over to your application when the build finishes.</p>
-              <div id="steps"></div>
-              <div class="note">
-                  Full build log: <code>ssh root@your-vm</code> then
-                  <code>tail -f /var/log/decloud/build.log</code>.
-                  Failed builds retry automatically every 2 minutes.
-              </div>
-          </div>
-          <script>
-              const STATES = { downloading:'active', installing:'active', starting:'active',
-                               running:'ready', ready:'ready', failed:'failed',
-                               unreachable:'warn', pending:'pending' };
-              const esc = s => String(s).replace(/[&<>"']/g,
-                  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-              async function poll() {
-                  try {
-                      const r = await fetch('/status', { cache: 'no-store' });
-                      const j = await r.json();
-                      const comps = Array.isArray(j.components) ? j.components : [];
-                      document.getElementById('steps').innerHTML = comps.map(c => {
-                          const cls = STATES[c.state] || 'pending';
-                          return '<div class="step ' + cls + '"><span class="dot"></span>' +
-                                 '<span class="name">' + esc(c.name) + '</span>' +
-                                 '<span class="detail">' + esc(c.detail || c.state) + '</span></div>';
-                      }).join('');
-                      // App took port 80 → this server is gone next poll;
-                      // reload lands on the real application.
-                      if (comps.some(c => c.name === 'app' && c.state === 'running')) {
-                          setTimeout(() => location.reload(), 3000);
-                      }
-                  } catch (e) {
-                      // Status server stopped — the app owns 80 now.
-                      setTimeout(() => location.reload(), 2000);
-                      return;
-                  }
-                  setTimeout(poll, 3000);
-              }
-              poll();
-          </script>
-      </body>
-      </html>
-
-  - path: /etc/systemd/system/repo-status.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=DeCloud repo-deploy build status page
-      After=network.target
-      # Once provisioned, never come back — the app owns port 80.
-      ConditionPathExists=!/var/lib/decloud/provisioned
-
-      [Service]
-      ExecStart=/opt/decloud/status/server.py
-      # on-failure (NOT always): provision.sh stops this deliberately to
-      # hand port 80 to the app. Restart=always respawned it 2s later and
-      # raced `docker run` for the port — the first run failed with "port
-      # in use" and left a stale daemon binding that blocked every retry.
-      # on-failure means a deliberate `stop` stays stopped (clean handoff),
-      # while a genuine crash still self-heals. The failure paths in
-      # provision.sh `systemctl start` it again explicitly, which works
-      # because the unit is never masked.
-      Restart=on-failure
-      RestartSec=2
-
-      [Install]
-      WantedBy=multi-user.target
-
 runcmd:
-  # Role entries run AFTER base entries (TemplateComposer ListConcat,
-  # base-first) — the provisioning timer is already armed by the time
-  # these run. Direct symlink instead of systemctl enable, consistent
-  # with the qemu-guest-agent pattern in base-tenant.
-  - ln -sf /etc/systemd/system/repo-status.service /etc/systemd/system/multi-user.target.wants/repo-status.service
-  - systemctl start repo-status
+  # Start QEMU guest agent (static unit — systemctl enable fails silently,
+  # so we use a direct symlink, consistent with the base-tenant pattern).
+  - ln -sf /lib/systemd/system/qemu-guest-agent.service /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+  - systemctl start qemu-guest-agent
+
+  # Configure SSH Certificate Authority.
+  - |
+    echo '' >> /etc/ssh/sshd_config
+    echo '# DeCloud: SSH Certificate Authority' >> /etc/ssh/sshd_config
+    echo 'TrustedUserCAKeys /etc/ssh/decloud_ca.pub' >> /etc/ssh/sshd_config
+    echo 'AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u' >> /etc/ssh/sshd_config
+
+  # Create SSH principals for certificate-based auth.
+  - mkdir -p /etc/ssh/auth_principals
+  - echo vm-__VM_ID__ > /etc/ssh/auth_principals/root
+  - chmod 644 /etc/ssh/auth_principals/root
+
+  # Create decloud config directory.
+  - mkdir -p /etc/decloud /var/lib/decloud
+
+  # Reload SSH to apply CA key and principals config (SIGHUP — no port downtime).
+  - systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+
+  # ── nginx front: owns port 80 from the start, proxies to the app ─────
+  # Serving the provisioning page immediately means the VM's URL shows a
+  # live status page from first boot, and flips to the app the moment it's
+  # up — no stop, no handoff. nginx binds 80 exactly once, for the life of
+  # the VM.
+  - rm -f /etc/nginx/sites-enabled/default
+  - ln -sf /etc/nginx/sites-available/repo-deploy /etc/nginx/sites-enabled/repo-deploy
+  - nginx -t && systemctl restart nginx
+  - systemctl enable nginx
+
+  # ── Arm the provisioning reconciler (contract v1) ────────────────────
+  # Base-tenant.yaml runcmd (which runs BEFORE these role entries) already
+  # armed decloud-provision.timer/.service; write_files has delivered the
+  # role's provision.sh by now, so the timer's condition sees it.
+  - systemctl daemon-reload
+  - systemctl enable --now decloud-provision.timer
+  - systemctl start --no-block decloud-provision.service
 
 final_message: |
   DeCloud VM __VM_NAME__ is up. Your repository is building now —
-  open https://__DECLOUD_DOMAIN__ to watch progress. The page hands
-  over to your app automatically when the build completes.
+  open https://__DECLOUD_DOMAIN__ to watch progress. The page becomes
+  your app automatically when the build completes.
