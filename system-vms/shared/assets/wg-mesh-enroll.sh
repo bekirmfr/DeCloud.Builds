@@ -108,9 +108,15 @@ if [ -n "$GATEWAY" ] && [ -n "$ROLE" ]; then
         [ -n "$FRESH_TUNNEL_IP" ] && WG_TUNNEL_IP="$FRESH_TUNNEL_IP"
         log "Using live relay config from NodeAgent: endpoint=${WG_RELAY_ENDPOINT}, api=${WG_RELAY_API}, tunnel=${WG_TUNNEL_IP}"
     else
-        log "NodeAgent wg-config not available — retrying..."
-        sleep 5
-        continue
+        # NodeAgent wg-config is a refresh of the currently-assigned relay, not a
+        # hard requirement: WG_RELAY_ENDPOINT/PUBKEY/TUNNEL_IP were sourced from
+        # wg-mesh.env and validated non-empty above. If the NodeAgent is briefly
+        # unreachable, proceed with those values instead of aborting —
+        # wg-config-fetch.sh wrote fresh ones just before calling us, and
+        # wg-mesh-watchdog.timer re-runs enrollment (re-fetching wg-config) if the
+        # handshake never establishes. A miss here self-corrects on the next tick;
+        # no ad-hoc retry loop belongs in this one-shot script.
+        log "NodeAgent wg-config unavailable — proceeding with wg-mesh.env relay values"
     fi
 fi
 

@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import urllib.request
 import urllib.error
@@ -53,6 +53,13 @@ last_routing_update = 0
 
 class HTTPProxyHandler(BaseHTTPRequestHandler):
     """HTTP proxy handler for CGNAT VM traffic"""
+
+    # Per-connection socket timeout (seconds). This proxy carries live tenant
+    # traffic; without a bound, a client that stalls mid-transfer pins its
+    # handler. With ThreadingHTTPServer that leaks one thread; the timeout caps it.
+    # Set to match the upstream forward timeout so a legitimately slow upstream
+    # isn't cut off early.
+    timeout = 30
 
     def log_message(self, format, *args):
         logger.info(f"{self.address_string()} - {format % args}")
@@ -275,7 +282,7 @@ def main():
 
     # Start HTTP server
     server_address = ('0.0.0.0', LISTEN_PORT)
-    httpd = HTTPServer(server_address, HTTPProxyHandler)
+    httpd = ThreadingHTTPServer(server_address, HTTPProxyHandler)
 
     logger.info('=' * 60)
     logger.info('DeCloud Relay HTTP Proxy')

@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
@@ -60,6 +60,10 @@ logger = logging.getLogger("blockstore-dashboard")
 
 # ==================== Request Handler ====================
 class BlockStoreDashboardHandler(BaseHTTPRequestHandler):
+
+    # Per-connection socket timeout (seconds). Bounds any request whose client
+    # write blocks on a half-dead socket, so a stuck handler can't leak a thread.
+    timeout = 15
 
     def log_message(self, format, *args):
         pass  # Suppress per-request access logs (journal is enough)
@@ -190,7 +194,7 @@ def main():
     if not os.path.isdir(STATIC_DIR):
         logger.warning("Static directory missing: %s", STATIC_DIR)
 
-    server = HTTPServer(("0.0.0.0", LISTEN_PORT), BlockStoreDashboardHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), BlockStoreDashboardHandler)
     logger.info("Block Store Dashboard server listening on :%d", LISTEN_PORT)
     logger.info("  Proxying API to block store binary on :%d", BLOCKSTORE_API_PORT)
     logger.info("  Proxied paths: %s", ", ".join(sorted(PROXY_PATHS)))
