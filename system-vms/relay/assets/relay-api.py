@@ -20,7 +20,7 @@ import os
 import logging
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import sys
 
@@ -724,6 +724,13 @@ def get_memory_usage():
 # ==================== Request Handler ====================
 class RelayAPIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for relay management API"""
+
+    # Per-connection socket timeout (seconds). Without it, a handler blocking on
+    # a write to a half-dead client — BrokenPipe with no TCP reset — hangs
+    # forever. On the old single-threaded server that froze the whole API; with
+    # ThreadingHTTPServer it would instead slowly leak one thread per stuck
+    # request. This bounds every request so neither can happen.
+    timeout = 15
     
     # Suppress default logging
     def log_message(self, format, *args):
@@ -1989,7 +1996,7 @@ def main():
     
     # Start HTTP server
     server_address = ('0.0.0.0', LISTEN_PORT)
-    httpd = HTTPServer(server_address, RelayAPIHandler)
+    httpd = ThreadingHTTPServer(server_address, RelayAPIHandler)
     
     logger.info('=' * 60)
     logger.info('DeCloud Relay VM Management API')
