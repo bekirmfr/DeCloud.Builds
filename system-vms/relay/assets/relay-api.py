@@ -53,6 +53,13 @@ STATIC_DIR = "/opt/decloud-relay/static"
 LISTEN_PORT = 8080
 PEER_REGISTRY_PATH = "/etc/decloud/peer-registry.json"
 PEER_METADATA_PATH = "/etc/decloud/peer-metadata.json"
+# Health-check cold-start grace: window after process start during which /health
+# returns 200 regardless of peer state, so a still-booting relay reaches Ready
+# before wg-quick + orchestrator-peer load complete. Matches DHT/blockstore
+# coldStartGraceSec (60). Env-tunable, mirroring DHT_MESH_MIN_PEERS etc.
+HEALTH_COLDSTART_SEC = int(os.environ.get('RELAY_HEALTH_COLDSTART_SEC', '60'))
+# Process start — anchor for the /health cold-start grace (mirrors blockstore startTime).
+START_TIME = time.time()
 
 # ==================== Periodic Cleanup Configuration ====================
 CLEANUP_ENABLED = True                    # Enable/disable automatic cleanup
@@ -810,12 +817,61 @@ class RelayAPIHandler(BaseHTTPRequestHandler):
     # ==================== API Endpoints ====================
     
     def health_check(self):
-        """Simple health check"""
+        """
+        Forwarding health for the relay.
+
+        200 while the relay is actually forwarding — WireGuard up AND >=1 peer. The
+        orchestrator peer (AllowedIPs 10.20.0.1/32) is baked into wg-relay-server.conf
+        at provision, so a healthy relay always has peer_count >= 1 even with zero
+        CGNAT customers. 503 when NOT forwarding: interface down, or zero peers
+        (orchestrator peer failed to load — the wedge signature this endpoint catches).
+
+        The host VmReadinessMonitor probes this as a liveness check; a sustained 503
+        re-demotes the relay to reality=Unhealthy and the node reconciler redeploys it.
+        A cold-start grace protects a still-booting relay from a false 503.
+        """
+        uptime = time.time() - START_TIME
+
+        # Cold-start grace: don't judge forwarding before wg-quick + the orchestrator
+        # peer have loaded. Mirrors DHT/blockstore coldStartGraceSec.
+        if uptime < HEALTH_COLDSTART_SEC:
+            self.send_json_response({
+                'status': 'healthy',
+                'relay_id': RELAY_ID,
+                'reason': 'cold-start grace period',
+                'uptime_seconds': int(uptime),
+                'timestamp': int(time.time())
+            })
+            return
+
+        wg = self.get_wireguard_status()
+        wireguard_up = wg.get('wireguard_up', False)
+        peer_count = wg.get('peer_count', 0)
+
+        if not wireguard_up:
+            healthy, reason = False, 'wireguard interface down'
+        elif peer_count == 0:
+            healthy, reason = False, 'no wireguard peers — orchestrator peer missing, not forwarding'
+        else:
+            healthy, reason = True, 'forwarding'
+
+        # ── v2 (DEFERRED): handshake freshness ──────────────────────────────────
+        # When enabled, additionally require a recent handshake on >=1 peer. The
+        # orchestrator peer carries PersistentKeepalive=25, so it stays fresh while
+        # the orchestrator is up — safe on an idle relay. Compute from
+        # wg['peers'][*]['latest_handshake'] vs a stale threshold (e.g. the existing
+        # STALE_THRESHOLD_SECONDS=300) and set healthy/reason here. Do NOT enable
+        # without confirming keepalive keeps >=1 peer fresh (it does — grounded).
+
         self.send_json_response({
-            'status': 'healthy',
+            'status': 'healthy' if healthy else 'unhealthy',
             'relay_id': RELAY_ID,
+            'reason': reason,
+            'wireguard_up': wireguard_up,
+            'peer_count': peer_count,
+            'uptime_seconds': int(uptime),
             'timestamp': int(time.time())
-        })
+        }, status_code=200 if healthy else 503)
     
     def get_relay_status(self):
         """Get comprehensive relay status"""
