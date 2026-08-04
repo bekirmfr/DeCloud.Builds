@@ -46,9 +46,31 @@ WG_DESCRIPTION="${WG_DESCRIPTION:-vm-peer}"
 WG_PEER_TYPE="${WG_PEER_TYPE:-system-vm}"
 WG_PARENT_NODE_ID="${WG_PARENT_NODE_ID:-}"
 
+# G19: if any relay field is empty (e.g. a boot-time wg-config-fetch timed out under a
+# stale relay IP and wrote a blank wg-mesh.env), refresh from the NodeAgent BEFORE
+# validating. Without this, the watchdog re-runs this script forever but exits here on
+# the empty env, never reaching the live-config refresh below — so a stranded VM can
+# never self-heal. Mirrors that refresh; runs only when something is actually missing.
+if [ -z "${WG_RELAY_ENDPOINT:-}" ] || [ -z "${WG_RELAY_PUBKEY:-}" ] || \
+   [ -z "${WG_TUNNEL_IP:-}" ] || [ -z "${WG_RELAY_API:-}" ]; then
+    _GW=$(ip route 2>/dev/null | awk '/default/ {print $3; exit}')
+    if [ -n "$_GW" ] && [ -n "${WG_ROLE:-}" ]; then
+        log "Relay fields empty — fetching live wg-config from NodeAgent before validating"
+        _CFG=$(curl -sf --max-time 5 "http://${_GW}:5100/api/obligations/${WG_ROLE}/wg-config" 2>/dev/null || true)
+        if [ -n "$_CFG" ] && echo "$_CFG" | jq -e '.relayEndpoint' >/dev/null 2>&1; then
+            WG_RELAY_ENDPOINT=$(echo "$_CFG" | jq -r '.relayEndpoint  // empty')
+            WG_RELAY_PUBKEY=$(echo   "$_CFG" | jq -r '.relayPublicKey // empty')
+            WG_RELAY_API=$(echo      "$_CFG" | jq -r '.relayApiUrl    // empty')
+            _FRESH_TUN=$(echo        "$_CFG" | jq -r '.tunnelIp       // empty')
+            [ -n "$_FRESH_TUN" ] && WG_TUNNEL_IP="$_FRESH_TUN"
+            log "Filled relay fields from NodeAgent: endpoint=${WG_RELAY_ENDPOINT}, tunnel=${WG_TUNNEL_IP}"
+        fi
+    fi
+fi
+
 for var in WG_RELAY_ENDPOINT WG_RELAY_PUBKEY WG_TUNNEL_IP WG_RELAY_API; do
     if [ -z "${!var:-}" ]; then
-        log_err "Missing required env: $var"
+        log_err "Missing required env: $var (NodeAgent wg-config unavailable — watchdog will retry)"
         exit 1
     fi
 done
